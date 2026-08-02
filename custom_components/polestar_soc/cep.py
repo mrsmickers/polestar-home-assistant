@@ -52,7 +52,7 @@ _SVC_INVOCATION = "/invocation.InvocationService"
 _METHOD_WINDOW_CONTROL = f"{_SVC_INVOCATION}/WindowControl"
 
 # BatteryState field numbers captured in raw_fields for debugging.
-_RAW_BATTERY_FIELD_NUMBERS = (5, 7, 8, 17, 26, 28)
+_RAW_BATTERY_FIELD_NUMBERS = (5, 7, 8, 10, 17, 26, 28)
 
 
 # ---------------------------------------------------------------------------
@@ -193,18 +193,21 @@ def _parse_battery_response(data: bytes) -> dict:
     for fn in _RAW_BATTERY_FIELD_NUMBERS:
         vals = state.get(fn)
         if vals is not None:
-            raw_fields[fn] = vals[0]
+            raw_fields[fn] = vals[-1]
+
+    def _int_or_none(field_num: int) -> int | None:
+        return _get_int(state, field_num) if field_num in state else None
 
     return {
         "soc": _get_double(state, 2),
-        "estimated_range_km": _get_int(state, 4) or None,
+        "estimated_range_km": _int_or_none(4),
         "charger_connection_status": _get_int(state, 6) or None,
-        "charging_status": _get_int(state, 7) or None,
+        "charging_status": _int_or_none(7),
         "avg_energy_consumption_kwh_per_100km": _get_double(state, 3),
-        "estimated_charging_time_minutes": _get_int(state, 5) or None,
-        "estimated_range_miles": _get_int(state, 8) or None,
-        "charging_power_watts": _get_int(state, 10) or None,
-        "charging_type": _get_int(state, 17) or None,
+        "estimated_charging_time_minutes": _int_or_none(5),
+        "estimated_range_miles": _int_or_none(8),
+        "charging_power_watts": _int_or_none(10),
+        "charging_type": _int_or_none(17),
         "raw_fields": raw_fields,
     }
 

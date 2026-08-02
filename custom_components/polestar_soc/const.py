@@ -215,6 +215,12 @@ CHARGING_TYPE_MAP: dict[int, str] = {
     4: "Wireless",
 }
 
+CEP_CHARGING_STATUS_MAP: dict[int, str] = {
+    1: "Charging",
+    2: "Idle",
+    3: "Scheduled",
+}
+
 # Weekday enum (ParkingClimateTimer)
 WEEKDAY_MAP: dict[int, str] = {
     1: "Monday",

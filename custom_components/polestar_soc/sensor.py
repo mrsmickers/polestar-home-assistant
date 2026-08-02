@@ -20,6 +20,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CEP_CHARGING_STATUS_MAP,
+    CHARGING_STATUS_MAP,
     CHARGING_TYPE_MAP,
     CLIMATE_RUNNING_STATUS_MAP,
     DOMAIN,
@@ -58,16 +60,84 @@ def _battery_soc(data: dict, vin: str) -> float | int | None:
 
 def _charging_status(data: dict, vin: str) -> str:
     battery = data.get("battery", {}).get(vin)
-    if battery is None:
+    if battery is not None:
+        raw_status = battery.get("chargingStatus")
+        if raw_status is not None:
+            return PolestarCoordinator.format_charging_status(raw_status)
+
+    cep_battery = data.get("cep_battery", {}).get(vin)
+    if cep_battery is None:
         return "Unknown"
-    return PolestarCoordinator.format_charging_status(battery.get("chargingStatus"))
+    return CEP_CHARGING_STATUS_MAP.get(cep_battery.get("charging_status"), "Unknown")
+
+
+_GRAPHQL_INACTIVE_CHARGING_STATUSES = {
+    "CHARGING_STATUS_IDLE",
+    "CHARGING_STATUS_DONE",
+    "CHARGING_STATUS_SCHEDULED",
+}
+
+
+def _cep_inactivity_indicators(cep_battery: dict) -> list[bool] | None:
+    """Return CEP indicator judgements, or None for an unknown enum."""
+    charging_status = cep_battery.get("charging_status")
+    charging_type = cep_battery.get("charging_type")
+    inactive_indicators: list[bool] = []
+
+    if charging_status is not None:
+        if charging_status not in CEP_CHARGING_STATUS_MAP:
+            return None
+        inactive_indicators.append(charging_status in (2, 3))
+
+    if charging_type is not None:
+        if charging_type not in CHARGING_TYPE_MAP:
+            return None
+        inactive_indicators.append(charging_type == 1)
+
+    return inactive_indicators
+
+
+def _cep_is_explicitly_not_charging(cep_battery: dict) -> bool:
+    """Return true only when all present recognized CEP indicators are inactive."""
+    inactive_indicators = _cep_inactivity_indicators(cep_battery)
+    if inactive_indicators is None:
+        return False
+    return bool(inactive_indicators) and all(inactive_indicators)
+
+
+def _is_explicitly_not_charging(data: dict, vin: str, cep_battery: dict) -> bool:
+    """Require every present GraphQL and CEP charging indicator to agree inactive."""
+    inactive_indicators = _cep_inactivity_indicators(cep_battery)
+    if inactive_indicators is None:
+        return False
+
+    battery = data.get("battery", {}).get(vin)
+    if battery is not None:
+        raw_status = battery.get("chargingStatus")
+        if raw_status is not None:
+            if raw_status not in CHARGING_STATUS_MAP:
+                return False
+            inactive_indicators.append(raw_status in _GRAPHQL_INACTIVE_CHARGING_STATUSES)
+
+    return bool(inactive_indicators) and all(inactive_indicators)
 
 
 def _charging_time_remaining(data: dict, vin: str) -> int | None:
     battery = data.get("battery", {}).get(vin)
-    if battery is None:
+    if battery is not None:
+        value = battery.get("estimatedChargingTimeToFullMinutes")
+        if value is not None:
+            return value
+
+    cep_battery = data.get("cep_battery", {}).get(vin)
+    if cep_battery is None:
         return None
-    return battery.get("estimatedChargingTimeToFullMinutes")
+    value = cep_battery.get("estimated_charging_time_minutes")
+    if value is not None:
+        return value
+    if _is_explicitly_not_charging(data, vin, cep_battery):
+        return 0
+    return None
 
 
 def _odometer_km(data: dict, vin: str) -> float | None:
@@ -130,7 +200,12 @@ def _charging_power(data: dict, vin: str) -> int | None:
     cep_battery = data.get("cep_battery", {}).get(vin)
     if cep_battery is None:
         return None
-    return cep_battery.get("charging_power_watts")
+    value = cep_battery.get("charging_power_watts")
+    if value is not None:
+        return value
+    if _is_explicitly_not_charging(data, vin, cep_battery):
+        return 0
+    return None
 
 
 def _charging_type(data: dict, vin: str) -> str | None:

@@ -2,6 +2,7 @@
 
 from custom_components.polestar_soc.sensor import (
     _battery_soc,
+    _cep_is_explicitly_not_charging,
     _charging_power,
     _charging_status,
     _charging_time_remaining,
@@ -58,6 +59,41 @@ class TestChargingStatus:
         data = {"battery": {}}
         assert _charging_status(data, VIN) == "Unknown"
 
+    def test_falls_back_to_cep_idle_when_graphql_missing(self):
+        data = {
+            "battery": {},
+            "cep_battery": {VIN: {"charging_status": 2}},
+        }
+        assert _charging_status(data, VIN) == "Idle"
+
+    def test_non_null_graphql_unspecified_remains_authoritative(self):
+        data = {
+            "battery": {VIN: {"chargingStatus": "CHARGING_STATUS_UNSPECIFIED"}},
+            "cep_battery": {VIN: {"charging_status": 2}},
+        }
+        assert _charging_status(data, VIN) == "Unknown"
+
+    def test_graphql_null_falls_back_to_cep(self):
+        data = {
+            "battery": {VIN: {"chargingStatus": None}},
+            "cep_battery": {VIN: {"charging_status": 3}},
+        }
+        assert _charging_status(data, VIN) == "Scheduled"
+
+    def test_unknown_cep_status_remains_unknown(self):
+        data = {
+            "battery": {},
+            "cep_battery": {VIN: {"charging_status": 99}},
+        }
+        assert _charging_status(data, VIN) == "Unknown"
+
+    def test_wrong_vin_cep_data_is_not_used(self):
+        data = {
+            "battery": {},
+            "cep_battery": {"OTHER": {"charging_status": 2}},
+        }
+        assert _charging_status(data, VIN) == "Unknown"
+
     def test_idle(self):
         data = {"battery": {VIN: {"chargingStatus": "CHARGING_STATUS_IDLE"}}}
         assert _charging_status(data, VIN) == "Idle"
@@ -74,6 +110,38 @@ class TestChargingTimeRemaining:
 
     def test_none_when_no_battery(self):
         data = {"battery": {}}
+        assert _charging_time_remaining(data, VIN) is None
+
+    def test_falls_back_to_cep_minutes_when_graphql_missing(self):
+        data = {
+            "battery": {},
+            "cep_battery": {VIN: {"estimated_charging_time_minutes": 45}},
+        }
+        assert _charging_time_remaining(data, VIN) == 45
+
+    def test_returns_zero_when_cep_reports_idle(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 2,
+                    "estimated_charging_time_minutes": None,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) == 0
+
+    def test_contradictory_cep_flags_do_not_infer_zero(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "estimated_charging_time_minutes": None,
+                    "charging_status": 1,
+                    "charging_type": 1,
+                }
+            },
+        }
         assert _charging_time_remaining(data, VIN) is None
 
     def test_zero_minutes(self):
@@ -194,9 +262,23 @@ class TestChargingPower:
         data = {"cep_battery": {VIN: {"charging_power_watts": 11000}}}
         assert _charging_power(data, VIN) == 11000
 
-    def test_none_when_not_charging(self, sample_coordinator_data):
-        # Fixture has charging_power_watts=None (not charging)
+    def test_graphql_charging_and_cep_not_charging_disagreement_is_unknown(
+        self, sample_coordinator_data
+    ):
+        # GraphQL says charging while CEP says not charging; do not fabricate zero power.
         assert _charging_power(sample_coordinator_data, VIN) is None
+
+    def test_contradictory_cep_flags_do_not_infer_zero(self):
+        data = {
+            "cep_battery": {
+                VIN: {
+                    "charging_power_watts": None,
+                    "charging_status": 1,
+                    "charging_type": 1,
+                }
+            }
+        }
+        assert _charging_power(data, VIN) is None
 
     def test_none_when_no_cep_battery(self):
         assert _charging_power({}, VIN) is None
@@ -204,6 +286,197 @@ class TestChargingPower:
     def test_none_when_missing_key(self):
         data = {"cep_battery": {VIN: {"soc": 76.0}}}
         assert _charging_power(data, VIN) is None
+
+
+class TestCepChargingMeasurementSafety:
+    def test_non_charging_truth_table(self):
+        cases = (
+            ({}, False),
+            ({"charging_status": 1}, False),
+            ({"charging_status": 2}, True),
+            ({"charging_status": 3}, True),
+            ({"charging_status": 99}, False),
+            ({"charging_type": 1}, True),
+            ({"charging_type": 2}, False),
+            ({"charging_type": 3}, False),
+            ({"charging_type": 4}, False),
+            ({"charging_type": 99}, False),
+            ({"charging_status": 2, "charging_type": 1}, True),
+            ({"charging_status": 3, "charging_type": 1}, True),
+            ({"charging_status": 1, "charging_type": 1}, False),
+            ({"charging_status": 2, "charging_type": 2}, False),
+            ({"charging_status": 99, "charging_type": 1}, False),
+            ({"charging_status": 2, "charging_type": 99}, False),
+        )
+
+        for telemetry, expected in cases:
+            assert _cep_is_explicitly_not_charging(telemetry) is expected
+
+    def test_explicit_zero_measurements_are_preserved_while_charging(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 1,
+                    "charging_type": 2,
+                    "estimated_charging_time_minutes": 0,
+                    "charging_power_watts": 0,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) == 0
+        assert _charging_power(data, VIN) == 0
+
+    def test_idle_status_with_active_type_does_not_infer_zero(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 2,
+                    "charging_type": 2,
+                    "estimated_charging_time_minutes": None,
+                    "charging_power_watts": None,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) is None
+        assert _charging_power(data, VIN) is None
+
+    def test_unknown_status_with_inactive_type_does_not_infer_zero(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 99,
+                    "charging_type": 1,
+                    "estimated_charging_time_minutes": None,
+                    "charging_power_watts": None,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) is None
+        assert _charging_power(data, VIN) is None
+
+    def test_consistent_active_indicators_keep_missing_measurements_unknown(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 1,
+                    "charging_type": 3,
+                    "estimated_charging_time_minutes": None,
+                    "charging_power_watts": None,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) is None
+        assert _charging_power(data, VIN) is None
+
+    def test_wrong_vin_does_not_supply_measurements(self):
+        data = {
+            "battery": {},
+            "cep_battery": {
+                "OTHER": {
+                    "charging_status": 2,
+                    "charging_type": 1,
+                    "estimated_charging_time_minutes": 0,
+                    "charging_power_watts": 0,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) is None
+        assert _charging_power(data, VIN) is None
+
+    def test_authoritative_graphql_noninactive_status_blocks_inferred_zero(self):
+        for graphql_status in (
+            "CHARGING_STATUS_CHARGING",
+            "CHARGING_STATUS_UNSPECIFIED",
+            "CHARGING_STATUS_FAULT",
+            "CHARGING_STATUS_BACKEND_FUTURE_VALUE",
+        ):
+            data = {
+                "battery": {
+                    VIN: {
+                        "chargingStatus": graphql_status,
+                        "estimatedChargingTimeToFullMinutes": None,
+                    }
+                },
+                "cep_battery": {
+                    VIN: {
+                        "charging_status": 2,
+                        "charging_type": 1,
+                        "estimated_charging_time_minutes": None,
+                        "charging_power_watts": None,
+                    }
+                },
+            }
+            assert _charging_time_remaining(data, VIN) is None
+            assert _charging_power(data, VIN) is None
+
+    def test_graphql_and_cep_inactive_agreement_allows_inferred_zero(self):
+        for graphql_status in (
+            "CHARGING_STATUS_IDLE",
+            "CHARGING_STATUS_DONE",
+            "CHARGING_STATUS_SCHEDULED",
+        ):
+            data = {
+                "battery": {
+                    VIN: {
+                        "chargingStatus": graphql_status,
+                        "estimatedChargingTimeToFullMinutes": None,
+                    }
+                },
+                "cep_battery": {
+                    VIN: {
+                        "charging_status": 2,
+                        "charging_type": 1,
+                        "estimated_charging_time_minutes": None,
+                        "charging_power_watts": None,
+                    }
+                },
+            }
+            assert _charging_time_remaining(data, VIN) == 0
+            assert _charging_power(data, VIN) == 0
+
+    def test_graphql_inactive_and_cep_active_disagreement_blocks_zero(self):
+        data = {
+            "battery": {
+                VIN: {
+                    "chargingStatus": "CHARGING_STATUS_IDLE",
+                    "estimatedChargingTimeToFullMinutes": None,
+                }
+            },
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 1,
+                    "charging_type": 2,
+                    "estimated_charging_time_minutes": None,
+                    "charging_power_watts": None,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) is None
+        assert _charging_power(data, VIN) is None
+
+    def test_explicit_measurement_zero_remains_authoritative_over_status(self):
+        data = {
+            "battery": {
+                VIN: {
+                    "chargingStatus": "CHARGING_STATUS_CHARGING",
+                    "estimatedChargingTimeToFullMinutes": None,
+                }
+            },
+            "cep_battery": {
+                VIN: {
+                    "charging_status": 1,
+                    "charging_type": 2,
+                    "estimated_charging_time_minutes": 0,
+                    "charging_power_watts": 0,
+                }
+            },
+        }
+        assert _charging_time_remaining(data, VIN) == 0
+        assert _charging_power(data, VIN) == 0
 
 
 class TestChargingType:

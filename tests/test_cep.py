@@ -23,6 +23,7 @@ from custom_components.polestar_soc.proto import (
     _encode_field_varint,
     _get_submessage,
 )
+from custom_components.polestar_soc.sensor import _charging_power, _charging_time_remaining
 
 # Synthetic test payloads built with a fake VIN.
 # ParkingClimatization: climate off, all seat heaters off
@@ -102,10 +103,72 @@ class TestParseBatteryResponse:
         assert result["avg_energy_consumption_kwh_per_100km"] == pytest.approx(2.9, abs=0.1)
         assert result["charger_connection_status"] == 2  # DISCONNECTED
         assert result["charging_status"] == 2  # IDLE (from field 7)
-        assert result["estimated_charging_time_minutes"] is None  # field 5 = 0
+        assert result["estimated_charging_time_minutes"] == 0  # explicit field 5 = 0
         assert result["estimated_range_miles"] == 140
         assert result["charging_power_watts"] is None  # field 10 not in payload
         assert result["charging_type"] == 1  # NONE (not charging)
+
+    def test_explicit_zero_time_and_power_preserve_wire_presence(self):
+        state = b"".join(
+            (
+                _encode_field_varint(5, 0),
+                _encode_field_varint(7, 1),
+                _encode_field_varint(10, 0),
+                _encode_field_varint(17, 2),
+            )
+        )
+        payload = _encode_field_bytes(3, state)
+
+        result = _parse_battery_response(payload)
+
+        assert result["estimated_charging_time_minutes"] == 0
+        assert result["charging_power_watts"] == 0
+        assert result["raw_fields"][5] == 0
+        assert result["raw_fields"][10] == 0
+
+    @pytest.mark.parametrize(
+        ("indicator_fields", "expected_status", "expected_type"),
+        (
+            (((7, 0), (17, 1)), 0, 1),
+            (((7, 2), (17, 0)), 2, 0),
+        ),
+    )
+    def test_explicit_unknown_indicator_blocks_end_to_end_zero_inference(
+        self,
+        indicator_fields,
+        expected_status,
+        expected_type,
+    ):
+        state = b"".join(_encode_field_varint(field, value) for field, value in indicator_fields)
+        cep_battery = _parse_battery_response(_encode_field_bytes(3, state))
+        data = {"battery": {}, "cep_battery": {TEST_VIN: cep_battery}}
+
+        assert cep_battery["charging_status"] == expected_status
+        assert cep_battery["charging_type"] == expected_type
+        assert _charging_time_remaining(data, TEST_VIN) is None
+        assert _charging_power(data, TEST_VIN) is None
+
+    @pytest.mark.parametrize(
+        ("indicator_fields", "expected_status", "expected_type"),
+        (
+            (((7, 2), (7, 1), (17, 1)), 1, 1),
+            (((7, 2), (17, 1), (17, 2)), 2, 2),
+        ),
+    )
+    def test_duplicate_indicators_use_last_value_and_block_contradictory_zero(
+        self,
+        indicator_fields,
+        expected_status,
+        expected_type,
+    ):
+        state = b"".join(_encode_field_varint(field, value) for field, value in indicator_fields)
+        cep_battery = _parse_battery_response(_encode_field_bytes(3, state))
+        data = {"battery": {}, "cep_battery": {TEST_VIN: cep_battery}}
+
+        assert cep_battery["charging_status"] == expected_status
+        assert cep_battery["charging_type"] == expected_type
+        assert _charging_time_remaining(data, TEST_VIN) is None
+        assert _charging_power(data, TEST_VIN) is None
 
     def test_raw_fields(self):
         result = _parse_battery_response(BATTERY_PAYLOAD)

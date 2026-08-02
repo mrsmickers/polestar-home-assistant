@@ -101,10 +101,10 @@ def _decode_message(data: bytes) -> dict[int, list]:
 
 
 def _get_int(fields: dict[int, list], field_number: int, default: int = 0) -> int:
-    """Extract an integer value from decoded fields."""
+    """Extract a singular integer using protobuf last-value semantics."""
     vals = fields.get(field_number)
     if vals:
-        return vals[0]
+        return vals[-1]
     return default
 
 
