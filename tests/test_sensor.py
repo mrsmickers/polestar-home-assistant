@@ -25,8 +25,16 @@ class TestBatterySoc:
     def test_returns_percentage(self, sample_coordinator_data):
         assert _battery_soc(sample_coordinator_data, VIN) == 72
 
-    def test_none_when_no_battery(self, sample_coordinator_data):
+    def test_falls_back_to_cep_when_graphql_battery_missing(self):
+        data = {
+            "battery": {},
+            "cep_battery": {VIN: {"soc": 76.0}},
+        }
+        assert _battery_soc(data, VIN) == 76.0
+
+    def test_none_when_no_battery_source(self, sample_coordinator_data):
         sample_coordinator_data["battery"] = {}
+        sample_coordinator_data["cep_battery"] = {}
         assert _battery_soc(sample_coordinator_data, VIN) is None
 
     def test_none_when_missing_key(self):

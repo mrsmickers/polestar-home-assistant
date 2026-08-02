@@ -43,11 +43,17 @@ class PolestarSensorDescription(SensorEntityDescription):
 # ---------------------------------------------------------------------------
 
 
-def _battery_soc(data: dict, vin: str) -> int | None:
+def _battery_soc(data: dict, vin: str) -> float | int | None:
     battery = data.get("battery", {}).get(vin)
-    if battery is None:
+    if battery is not None:
+        value = battery.get("batteryChargeLevelPercentage")
+        if value is not None:
+            return value
+
+    cep_battery = data.get("cep_battery", {}).get(vin)
+    if cep_battery is None:
         return None
-    return battery.get("batteryChargeLevelPercentage")
+    return cep_battery.get("soc")
 
 
 def _charging_status(data: dict, vin: str) -> str:
