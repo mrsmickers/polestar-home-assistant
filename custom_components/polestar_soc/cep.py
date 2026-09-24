@@ -58,7 +58,7 @@ _METHOD_WINDOW_CONTROL = f"{_SVC_INVOCATION}/WindowControl"
 
 # BatteryState field numbers captured in raw_fields for debugging.
 _RAW_BATTERY_FIELD_NUMBERS = (5, 7, 8, 10, 17, 26, 28)
-_SOFTWARE_VERSION_PATTERN = re.compile(r"^P[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+_SOFTWARE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+() /-]{0,63}$")
 
 
 class CepDataError(HomeAssistantError):
@@ -186,7 +186,9 @@ def _parse_mycars_response(data: bytes, vin: str) -> dict:
     version = matching["installed_software_version"]
     if not version:
         raise CepDataError("GetMyCars matched the requested VIN but omitted software version")
-    if _SOFTWARE_VERSION_PATTERN.fullmatch(version) is None:
+    if _SOFTWARE_VERSION_PATTERN.fullmatch(version) is None or not any(
+        "0" <= char <= "9" for char in version
+    ):
         raise CepDataError("GetMyCars returned an invalid installed software version")
     return matching
 

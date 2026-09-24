@@ -166,8 +166,13 @@ class TestMyCars:
         with pytest.raises(CepDataError, match="invalid UTF-8"):
             _parse_mycars_response(payload, TEST_VIN)
 
-    def test_parser_rejects_invalid_version_format(self):
+    def test_parser_accepts_version_without_p_prefix(self):
         payload = _encode_field_bytes(1, self._entry(TEST_VIN, "4.2.11"))
+        result = _parse_mycars_response(payload, TEST_VIN)
+        assert result["installed_software_version"] == "4.2.11"
+
+    def test_parser_rejects_version_without_ascii_digit(self):
+        payload = _encode_field_bytes(1, self._entry(TEST_VIN, "latest"))
         with pytest.raises(CepDataError, match="invalid installed software version"):
             _parse_mycars_response(payload, TEST_VIN)
 
