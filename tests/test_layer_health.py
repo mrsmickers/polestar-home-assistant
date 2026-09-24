@@ -129,7 +129,7 @@ class TestLayerHealthCycleAccounting:
         assert snap[LAYER_PCCS]["consecutive_failures"] == 2
 
     def test_partial_success_resets_counter_but_lists_endpoint(self):
-        """Partial success keeps the layer ok but the failing endpoint is exposed."""
+        """Partial success is degraded and exposes the failing endpoint."""
         h = _LayerHealth()
         h.start_cycle()
         h.record_failure(
@@ -140,7 +140,7 @@ class TestLayerHealthCycleAccounting:
         h.record_success(LAYER_GRAPHQL, "carTelematicsV2.odometer")
         h.end_cycle()
         snap = h.to_dict()
-        assert snap[LAYER_GRAPHQL]["status"] == "ok"
+        assert snap[LAYER_GRAPHQL]["status"] == "degraded"
         assert snap[LAYER_GRAPHQL]["consecutive_failures"] == 0
         assert snap[LAYER_GRAPHQL]["failing_endpoints"] == ["carTelematicsV2.battery"]
 

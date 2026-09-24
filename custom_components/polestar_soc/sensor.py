@@ -259,6 +259,13 @@ def _service_warning(data: dict, vin: str) -> str | None:
     return SERVICE_WARNING_MAP.get(val)
 
 
+def _software_version(data: dict, vin: str) -> str | None:
+    software = data.get("software", {}).get(vin)
+    if software is None:
+        return None
+    return software.get("installed_software_version") or None
+
+
 # Options lists for ENUM sensors
 _CLIMATE_STATUS_OPTIONS = list(CLIMATE_RUNNING_STATUS_MAP.values())
 _HEATING_INTENSITY_OPTIONS = list(HEATING_INTENSITY_MAP.values())
@@ -268,6 +275,12 @@ _SERVICE_WARNING_OPTIONS = list(SERVICE_WARNING_MAP.values())
 _CHARGING_TYPE_OPTIONS = list(CHARGING_TYPE_MAP.values())
 
 SENSOR_DESCRIPTIONS: tuple[PolestarSensorDescription, ...] = (
+    PolestarSensorDescription(
+        key="software_version",
+        translation_key="software_version",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_software_version,
+    ),
     PolestarSensorDescription(
         key="battery_soc",
         translation_key="battery_soc",
@@ -542,10 +555,11 @@ class PolestarApiHealthSensor(CoordinatorEntity[PolestarCoordinator], SensorEnti
         api_health = (self.coordinator.data or {}).get("api_health") or {}
         worst = "ok"
         for layer in api_health.values():
+            status = layer.get("status", "ok")
             failures = layer.get("consecutive_failures", 0)
-            if failures >= 2:
+            if status == "down" or failures >= 2:
                 return "down"
-            if failures == 1:
+            if status == "degraded" or failures == 1 or layer.get("failing_endpoints"):
                 worst = "degraded"
         return worst
 

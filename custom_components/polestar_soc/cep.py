@@ -10,6 +10,8 @@ Uses the web OAuth access token for reads and the PCCS 2FA token for writes.
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 
 import grpc
 from homeassistant.exceptions import HomeAssistantError
@@ -20,6 +22,7 @@ from .const import (
     CLIMATE_RUNNING_STATUS_MAP,
     HEATING_INTENSITY_MAP,
     INVOCATION_STATUS_MAP,
+    VIN_PATTERN,
 )
 from .proto import (
     _decode_message,
@@ -28,6 +31,7 @@ from .proto import (
     _get_double,
     _get_float,
     _get_int,
+    _get_optional_int,
     _get_submessage,
     _identity_deserialize,
     _identity_serialize,
@@ -48,11 +52,37 @@ _METHOD_GET_AVAILABILITY = (
 )
 _METHOD_GET_HEALTH = "/services.vehiclestates.health.HealthService/GetHealth"
 _METHOD_GET_LOCATION = "/dtlinternet.DtlInternetService/GetLastKnownLocation"
+_METHOD_GET_MYCARS = "/car_information.CarInformation/GetMyCars"
 _SVC_INVOCATION = "/invocation.InvocationService"
 _METHOD_WINDOW_CONTROL = f"{_SVC_INVOCATION}/WindowControl"
 
 # BatteryState field numbers captured in raw_fields for debugging.
 _RAW_BATTERY_FIELD_NUMBERS = (5, 7, 8, 10, 17, 26, 28)
+_SOFTWARE_VERSION_PATTERN = re.compile(r"^P[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+
+
+class CepDataError(HomeAssistantError):
+    """A CEP response could not be attributed or validated safely."""
+
+
+def _require_valid_vin(vin: str, *, source: str) -> None:
+    """Reject missing or malformed VINs before identity-sensitive work."""
+    if not isinstance(vin, str) or VIN_PATTERN.fullmatch(vin) is None:
+        raise CepDataError(f"GetMyCars received an invalid {source} VIN")
+
+
+def _get_strict_utf8(fields: dict[int, list], field_number: int, label: str) -> str:
+    """Decode the last value of a singular string field as strict UTF-8."""
+    values = fields.get(field_number)
+    if not values:
+        return ""
+    raw = values[-1]
+    if not isinstance(raw, (bytes, bytearray)):
+        raise CepDataError(f"GetMyCars {label} field has the wrong wire type")
+    try:
+        return bytes(raw).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as err:
+        raise CepDataError(f"GetMyCars {label} field contains invalid UTF-8") from err
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +98,14 @@ def _build_vin_request(vin: str) -> bytes:
 def _build_location_request(vin: str) -> bytes:
     """Build a request with VIN as field 1 (DtlInternetService uses field 1, not field 2)."""
     return _encode_field_bytes(1, vin.encode("utf-8"))
+
+
+def _build_get_mycars_request(vin: str) -> bytes:
+    """Build a GetMyCars request with request ID and VIN."""
+    _require_valid_vin(vin, source="requested")
+    return _encode_field_bytes(1, str(uuid.uuid4()).encode("utf-8")) + _encode_field_bytes(
+        2, vin.encode("utf-8")
+    )
 
 
 def _build_cep_invocation_request(vin: str) -> bytes:
@@ -100,6 +138,57 @@ def _build_window_control_request(vin: str, control_type: int) -> bytes:
 # ---------------------------------------------------------------------------
 # Response parsers
 # ---------------------------------------------------------------------------
+
+
+def _parse_mycars_response(data: bytes, vin: str) -> dict:
+    """Parse GetMyCars and return the entry matching ``vin``.
+
+    GetMyCarsResponse field 1 is a repeated MyCarEntry. Each entry's field
+    1 contains car details, where fields 1/6/7/9/10 are VIN, model name,
+    model year, installed software version, and market respectively.
+    """
+    _require_valid_vin(vin, source="requested")
+    if not data:
+        raise CepDataError("GetMyCars returned an empty response")
+
+    entries: list[dict] = []
+    try:
+        raw_entries = _decode_message(data).get(1, [])
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, (bytes, bytearray)):
+                raise ValueError("GetMyCars entry has the wrong wire type")
+            details = _get_submessage(_decode_message(bytes(raw_entry)), 1)
+            if details is None:
+                raise ValueError("GetMyCars entry omitted car details")
+            entry = {
+                "vin": _get_strict_utf8(details, 1, "VIN"),
+                "model_name": _get_strict_utf8(details, 6, "model name"),
+                "model_year": _get_strict_utf8(details, 7, "model year"),
+                "installed_software_version": _get_strict_utf8(
+                    details, 9, "software version"
+                ),
+                "market": _get_strict_utf8(details, 10, "market"),
+            }
+            if entry["vin"] and VIN_PATTERN.fullmatch(entry["vin"]) is None:
+                raise ValueError("GetMyCars entry contains an invalid VIN")
+            entries.append(entry)
+    except ValueError as err:
+        raise CepDataError("GetMyCars returned malformed protobuf data") from err
+
+    matches = [entry for entry in entries if entry["vin"] == vin]
+    if not matches:
+        raise CepDataError(
+            f"GetMyCars returned {len(entries)} entries but none matched the requested VIN"
+        )
+    if len(matches) != 1:
+        raise CepDataError("GetMyCars returned duplicate entries for the requested VIN")
+    matching = matches[0]
+    version = matching["installed_software_version"]
+    if not version:
+        raise CepDataError("GetMyCars matched the requested VIN but omitted software version")
+    if _SOFTWARE_VERSION_PATTERN.fullmatch(version) is None:
+        raise CepDataError("GetMyCars returned an invalid installed software version")
+    return matching
 
 
 def _format_climate_status(value: int) -> str:
@@ -191,12 +280,12 @@ def _parse_battery_response(data: bytes) -> dict:
 
     raw_fields = {}
     for fn in _RAW_BATTERY_FIELD_NUMBERS:
-        vals = state.get(fn)
-        if vals is not None:
-            raw_fields[fn] = vals[-1]
+        value = _get_optional_int(state, fn)
+        if value is not None:
+            raw_fields[fn] = value
 
     def _int_or_none(field_num: int) -> int | None:
-        return _get_int(state, field_num) if field_num in state else None
+        return _get_optional_int(state, field_num)
 
     return {
         "soc": _get_double(state, 2),
@@ -507,6 +596,25 @@ class CepClient:
             return _parse_climate_response(response)
         except grpc.RpcError as err:
             _LOGGER.debug("CEP GetLatestParkingClimatization failed: %s", err)
+            raise
+
+    def get_mycars(self, vin: str) -> dict:
+        """Get vehicle identity and currently installed software version."""
+        channel = self._get_channel()
+        method = channel.unary_unary(
+            _METHOD_GET_MYCARS,
+            request_serializer=_identity_serialize,
+            response_deserializer=_identity_deserialize,
+        )
+        try:
+            response = method(
+                _build_get_mycars_request(vin),
+                metadata=tuple(self._metadata(vin)),
+                timeout=30,
+            )
+            return _parse_mycars_response(response, vin)
+        except grpc.RpcError as err:
+            _LOGGER.debug("CEP GetMyCars failed: %s", err)
             raise
 
     def get_battery(self, vin: str) -> dict:

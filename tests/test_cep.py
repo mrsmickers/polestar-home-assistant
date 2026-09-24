@@ -5,6 +5,9 @@ import struct
 import pytest
 
 from custom_components.polestar_soc.cep import (
+    _METHOD_GET_MYCARS,
+    CepDataError,
+    _build_get_mycars_request,
     _build_location_request,
     _build_vin_request,
     _format_climate_status,
@@ -15,15 +18,21 @@ from custom_components.polestar_soc.cep import (
     _parse_exterior_response,
     _parse_health_response,
     _parse_location_response,
+    _parse_mycars_response,
 )
 from custom_components.polestar_soc.proto import (
     _decode_message,
     _encode_field_bytes,
     _encode_field_fixed32,
     _encode_field_varint,
+    _encode_varint,
     _get_submessage,
 )
-from custom_components.polestar_soc.sensor import _charging_power, _charging_time_remaining
+from custom_components.polestar_soc.sensor import (
+    _charging_power,
+    _charging_time_remaining,
+    _software_version,
+)
 
 # Synthetic test payloads built with a fake VIN.
 # ParkingClimatization: climate off, all seat heaters off
@@ -57,6 +66,126 @@ class TestBuildVinRequest:
         # Should be: tag(field 2, wire type 2) + varint(len) + VIN bytes
         expected = _encode_field_bytes(2, TEST_VIN.encode("utf-8"))
         assert result == expected
+
+
+class TestMyCars:
+    @staticmethod
+    def _entry(vin: str, version: str) -> bytes:
+        details = b"".join(
+            (
+                _encode_field_bytes(1, vin.encode()),
+                _encode_field_bytes(6, b"Polestar 4"),
+                _encode_field_bytes(7, b"2026"),
+                _encode_field_bytes(9, version.encode()),
+                _encode_field_bytes(10, b"GB"),
+            )
+        )
+        return _encode_field_bytes(1, details)
+
+    def test_service_path(self):
+        assert _METHOD_GET_MYCARS == "/car_information.CarInformation/GetMyCars"
+
+    def test_request_contains_uuid_and_vin(self):
+        fields = _decode_message(_build_get_mycars_request(TEST_VIN))
+        assert len(fields[1][0].decode()) == 36
+        assert fields[2] == [TEST_VIN.encode()]
+
+    def test_request_rejects_missing_vin(self):
+        with pytest.raises(CepDataError, match="invalid requested VIN"):
+            _build_get_mycars_request("")
+
+    def test_parser_selects_matching_vin_from_multiple_entries(self):
+        other = self._entry("WVWZZZ1JZXW000001", "P4.2.10")
+        wanted = self._entry(TEST_VIN, "P4.2.11")
+        result = _parse_mycars_response(
+            _encode_field_bytes(1, other) + _encode_field_bytes(1, wanted),
+            TEST_VIN,
+        )
+        assert result == {
+            "vin": TEST_VIN,
+            "model_name": "Polestar 4",
+            "model_year": "2026",
+            "installed_software_version": "P4.2.11",
+            "market": "GB",
+        }
+
+    def test_parser_rejects_wrong_explicit_vin(self):
+        payload = _encode_field_bytes(1, self._entry("WVWZZZ1JZXW000001", "P4.2.10"))
+        with pytest.raises(CepDataError, match="none matched"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_single_entry_with_omitted_vin(self):
+        payload = _encode_field_bytes(1, self._entry("", "P4.2.11"))
+        with pytest.raises(CepDataError, match="none matched"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_uses_last_value_for_duplicate_singular_fields(self):
+        details = b"".join(
+            (
+                _encode_field_bytes(1, b"WVWZZZ1JZXW000001"),
+                _encode_field_bytes(1, TEST_VIN.encode()),
+                _encode_field_bytes(9, b"P4.2.10"),
+                _encode_field_bytes(9, b"P4.2.11"),
+            )
+        )
+        payload = _encode_field_bytes(1, _encode_field_bytes(1, details))
+        result = _parse_mycars_response(payload, TEST_VIN)
+        assert result["vin"] == TEST_VIN
+        assert result["installed_software_version"] == "P4.2.11"
+
+    def test_parser_uses_last_duplicate_details_message(self):
+        wrong_entry = _decode_message(self._entry("WVWZZZ1JZXW000001", "P4.2.10"))[1][0]
+        wanted_entry = _decode_message(self._entry(TEST_VIN, "P4.2.11"))[1][0]
+        entry = _encode_field_bytes(1, wrong_entry) + _encode_field_bytes(1, wanted_entry)
+        result = _parse_mycars_response(_encode_field_bytes(1, entry), TEST_VIN)
+        assert result["installed_software_version"] == "P4.2.11"
+
+    def test_parser_rejects_missing_installed_version(self):
+        payload = _encode_field_bytes(1, self._entry(TEST_VIN, ""))
+        with pytest.raises(CepDataError, match="omitted software version"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_empty_response(self):
+        with pytest.raises(CepDataError, match="empty response"):
+            _parse_mycars_response(b"", TEST_VIN)
+
+    def test_parser_rejects_empty_requested_vin_even_with_empty_entry_vin(self):
+        payload = _encode_field_bytes(1, self._entry("", "P4.2.11"))
+        with pytest.raises(CepDataError, match="invalid requested VIN"):
+            _parse_mycars_response(payload, "")
+
+    def test_parser_rejects_truncated_length_delimited_version(self):
+        details = _encode_field_bytes(1, TEST_VIN.encode()) + b"\x4a\x06P4.2"
+        payload = _encode_field_bytes(1, _encode_field_bytes(1, details))
+        with pytest.raises(CepDataError, match="malformed protobuf"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_invalid_utf8_version(self):
+        details = _encode_field_bytes(1, TEST_VIN.encode()) + _encode_field_bytes(9, b"\xff")
+        payload = _encode_field_bytes(1, _encode_field_bytes(1, details))
+        with pytest.raises(CepDataError, match="invalid UTF-8"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_invalid_version_format(self):
+        payload = _encode_field_bytes(1, self._entry(TEST_VIN, "4.2.11"))
+        with pytest.raises(CepDataError, match="invalid installed software version"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_unicode_digits_in_version(self):
+        payload = _encode_field_bytes(1, self._entry(TEST_VIN, "P٤.٢.١١"))
+        with pytest.raises(CepDataError, match="invalid installed software version"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_parser_rejects_duplicate_entries_for_requested_vin(self):
+        payload = _encode_field_bytes(
+            1, self._entry(TEST_VIN, "P4.2.10")
+        ) + _encode_field_bytes(1, self._entry(TEST_VIN, "P4.2.11"))
+        with pytest.raises(CepDataError, match="duplicate entries"):
+            _parse_mycars_response(payload, TEST_VIN)
+
+    def test_software_sensor_returns_installed_version(self):
+        data = {"software": {TEST_VIN: {"installed_software_version": "P4.2.11"}}}
+        assert _software_version(data, TEST_VIN) == "P4.2.11"
 
 
 class TestParseClimateResponse:
@@ -107,6 +236,25 @@ class TestParseBatteryResponse:
         assert result["estimated_range_miles"] == 140
         assert result["charging_power_watts"] is None  # field 10 not in payload
         assert result["charging_type"] == 1  # NONE (not charging)
+
+    def test_soc_ignores_later_wrong_wire_varint(self):
+        state = (
+            _encode_varint((2 << 3) | 1)
+            + struct.pack("<d", 76.0)
+            + _encode_field_varint(2, 0)
+        )
+        result = _parse_battery_response(_encode_field_bytes(3, state))
+        assert result["soc"] == pytest.approx(76.0)
+
+    def test_charging_status_ignores_later_wrong_wire_fixed32(self):
+        state = (
+            _encode_field_varint(7, 1)
+            + _encode_varint((7 << 3) | 5)
+            + struct.pack("<I", 2)
+        )
+        result = _parse_battery_response(_encode_field_bytes(3, state))
+        assert result["charging_status"] == 1
+        assert result["raw_fields"][7] == 1
 
     def test_explicit_zero_time_and_power_preserve_wire_presence(self):
         state = b"".join(

@@ -10,6 +10,17 @@ from __future__ import annotations
 
 import struct
 
+
+class _WireInt(int):
+    """Integer value retaining the protobuf wire type it was decoded from."""
+
+    wire_type: int
+
+    def __new__(cls, value: int, wire_type: int) -> _WireInt:
+        instance = int.__new__(cls, value)
+        instance.wire_type = wire_type
+        return instance
+
 # ---------------------------------------------------------------------------
 # Encoding
 # ---------------------------------------------------------------------------
@@ -74,18 +85,27 @@ def _decode_message(data: bytes) -> dict[int, list]:
         tag, pos = _decode_varint(data, pos)
         field_number = tag >> 3
         wire_type = tag & 0x07
+        if field_number == 0:
+            raise ValueError("Invalid protobuf field number 0")
 
         if wire_type == 0:  # varint
-            value, pos = _decode_varint(data, pos)
+            decoded, pos = _decode_varint(data, pos)
+            value = _WireInt(decoded, wire_type)
         elif wire_type == 2:  # length-delimited
             length, pos = _decode_varint(data, pos)
+            if length > len(data) - pos:
+                raise ValueError("Truncated length-delimited field")
             value = data[pos : pos + length]
             pos += length
         elif wire_type == 5:  # fixed32
-            value = struct.unpack_from("<I", data, pos)[0]
+            if len(data) - pos < 4:
+                raise ValueError("Truncated fixed32 field")
+            value = _WireInt(struct.unpack_from("<I", data, pos)[0], wire_type)
             pos += 4
         elif wire_type == 1:  # fixed64
-            value = struct.unpack_from("<Q", data, pos)[0]
+            if len(data) - pos < 8:
+                raise ValueError("Truncated fixed64 field")
+            value = _WireInt(struct.unpack_from("<Q", data, pos)[0], wire_type)
             pos += 8
         else:
             raise ValueError(f"Unsupported wire type {wire_type}")
@@ -100,12 +120,21 @@ def _decode_message(data: bytes) -> dict[int, list]:
 # ---------------------------------------------------------------------------
 
 
+def _get_optional_int(fields: dict[int, list], field_number: int) -> int | None:
+    """Extract the last varint occurrence, or ``None`` if no typed value exists."""
+    for value in reversed(fields.get(field_number, [])):
+        if isinstance(value, _WireInt) and value.wire_type == 0:
+            return int(value)
+        if isinstance(value, int) and not isinstance(value, _WireInt):
+            # Preserve compatibility with hand-built field dictionaries.
+            return value
+    return None
+
+
 def _get_int(fields: dict[int, list], field_number: int, default: int = 0) -> int:
-    """Extract a singular integer using protobuf last-value semantics."""
-    vals = fields.get(field_number)
-    if vals:
-        return vals[-1]
-    return default
+    """Extract the last varint occurrence, ignoring wrong wire types."""
+    value = _get_optional_int(fields, field_number)
+    return default if value is None else value
 
 
 def _get_bool(fields: dict[int, list], field_number: int) -> bool:
@@ -114,48 +143,53 @@ def _get_bool(fields: dict[int, list], field_number: int) -> bool:
 
 
 def _get_submessage(fields: dict[int, list], field_number: int) -> dict[int, list] | None:
-    """Extract and decode a sub-message from decoded fields."""
-    vals = fields.get(field_number)
-    if vals and isinstance(vals[0], (bytes, bytearray)):
-        return _decode_message(vals[0])
-    return None
+    """Extract a singular sub-message using protobuf merge semantics.
+
+    Repeated occurrences of a singular embedded message are merged in wire
+    order. Scalar helpers then select the last value for each merged field.
+    """
+    vals = [
+        bytes(value)
+        for value in fields.get(field_number, [])
+        if isinstance(value, (bytes, bytearray))
+    ]
+    if not vals:
+        return None
+
+    merged: dict[int, list] = {}
+    for raw in vals:
+        for nested_field, nested_values in _decode_message(raw).items():
+            merged.setdefault(nested_field, []).extend(nested_values)
+    return merged
 
 
 def _get_string(fields: dict[int, list], field_number: int, default: str = "") -> str:
-    """Extract and decode a UTF-8 string from a length-delimited field."""
-    vals = fields.get(field_number)
-    if vals and isinstance(vals[0], (bytes, bytearray)):
-        return vals[0].decode("utf-8", errors="replace")
+    """Extract the last length-delimited UTF-8 string occurrence."""
+    for value in reversed(fields.get(field_number, [])):
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8", errors="replace")
     return default
 
 
 def _get_float(fields: dict[int, list], field_number: int) -> float | None:
-    """Extract a float (IEEE 754) from a fixed32 field.
-
-    _decode_message stores wire type 5 as uint32.  This helper reinterprets
-    the raw bits as a single-precision float.
-    """
-    vals = fields.get(field_number)
-    if not vals:
-        return None
-    raw = vals[0]
-    if isinstance(raw, int):
-        return struct.unpack("<f", struct.pack("<I", raw))[0]
+    """Extract the last correctly typed IEEE 754 fixed32 occurrence."""
+    for raw in reversed(fields.get(field_number, [])):
+        if isinstance(raw, _WireInt) and raw.wire_type == 5:
+            return struct.unpack("<f", struct.pack("<I", int(raw)))[0]
+        if isinstance(raw, int) and not isinstance(raw, _WireInt):
+            # Preserve compatibility with hand-built field dictionaries.
+            return struct.unpack("<f", struct.pack("<I", raw))[0]
     return None
 
 
 def _get_double(fields: dict[int, list], field_number: int) -> float | None:
-    """Extract a double (IEEE 754) from a fixed64 field.
-
-    _decode_message stores wire type 1 as uint64.  This helper reinterprets
-    the raw bits as a double-precision float.
-    """
-    vals = fields.get(field_number)
-    if not vals:
-        return None
-    raw = vals[0]
-    if isinstance(raw, int):
-        return struct.unpack("<d", struct.pack("<Q", raw))[0]
+    """Extract the last correctly typed IEEE 754 fixed64 occurrence."""
+    for raw in reversed(fields.get(field_number, [])):
+        if isinstance(raw, _WireInt) and raw.wire_type == 1:
+            return struct.unpack("<d", struct.pack("<Q", int(raw)))[0]
+        if isinstance(raw, int) and not isinstance(raw, _WireInt):
+            # Preserve compatibility with hand-built field dictionaries.
+            return struct.unpack("<d", struct.pack("<Q", raw))[0]
     return None
 
 
@@ -207,23 +241,11 @@ def _parse_invocation_response(data: bytes) -> dict:
     if inner is None:
         return empty
 
-    id_val = inner.get(1, [b""])[0]
-    if isinstance(id_val, bytes):
-        id_val = id_val.decode("utf-8", errors="replace")
-
-    vin_val = inner.get(2, [b""])[0]
-    if isinstance(vin_val, bytes):
-        vin_val = vin_val.decode("utf-8", errors="replace")
-
-    msg_val = inner.get(4, [b""])[0]
-    if isinstance(msg_val, bytes):
-        msg_val = msg_val.decode("utf-8", errors="replace")
-
     return {
-        "id": id_val,
-        "vin": vin_val,
+        "id": _get_string(inner, 1),
+        "vin": _get_string(inner, 2),
         "status": _get_int(inner, 3, 0),
-        "message": msg_val,
+        "message": _get_string(inner, 4),
     }
 
 

@@ -38,6 +38,9 @@
   },
   "entity": {
     "sensor": {
+      "software_version": {
+        "name": "Software version"
+      },
       "battery_soc": {
         "name": "Battery SOC"
       },

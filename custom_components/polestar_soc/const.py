@@ -1,9 +1,13 @@
 """Constants for the Polestar State of Charge integration."""
 
+import re
 from datetime import timedelta
 
 DOMAIN = "polestar_soc"
 SCAN_INTERVAL = timedelta(minutes=5)
+
+# ISO 3779 VIN: exactly 17 uppercase alphanumerics, excluding I, O and Q.
+VIN_PATTERN = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
 
 # OAuth2 / OIDC constants
 OIDC_BASE_URL = "https://polestarid.eu.polestar.com"

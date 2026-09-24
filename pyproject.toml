@@ -1,6 +1,6 @@
 [project]
 name = "polestar-soc"
-version = "1.0.0"
+version = "1.0.1"
 description = "Polestar State of Charge – Home Assistant custom integration"
 requires-python = ">=3.12"
 

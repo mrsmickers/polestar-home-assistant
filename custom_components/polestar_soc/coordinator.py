@@ -35,6 +35,7 @@ from .const import (
     REDIRECT_URI,
     SCAN_INTERVAL,
     SCOPE,
+    VIN_PATTERN,
 )
 from .pccs import PccsClient
 
@@ -181,7 +182,7 @@ class _LayerHealth:
             failures = state["consecutive_failures"]
             if failures >= 2:
                 status = "down"
-            elif failures == 1:
+            elif failures == 1 or state["failing_endpoints"]:
                 status = "degraded"
             else:
                 status = "ok"
@@ -919,10 +920,22 @@ class PolestarCoordinator(DataUpdateCoordinator):
                 "exterior": {},
                 "availability": {},
                 "health": {},
+                "software": {},
                 "api_health": health.to_dict(),
             }
 
-        vins = [v["vin"] for v in vehicles]
+        vins: list[str] = []
+        for vehicle in vehicles:
+            vin = vehicle.get("vin") if isinstance(vehicle, dict) else None
+            if not isinstance(vin, str) or VIN_PATTERN.fullmatch(vin) is None:
+                health.record_failure(
+                    LAYER_GRAPHQL,
+                    "getConsumerCarsV2",
+                    _NonGrpcError("vehicle list contained an invalid VIN"),
+                )
+                health.end_cycle()
+                raise UpdateFailed("Polestar API returned a vehicle with an invalid VIN")
+            vins.append(vin)
 
         # ---- GraphQL: telematics (battery + odometer split) ----
         try:
@@ -933,8 +946,8 @@ class PolestarCoordinator(DataUpdateCoordinator):
                 health.record_failure(LAYER_GRAPHQL, endpoint, err)
             health.end_cycle()
             raise
-        # Mark whichever sub-queries succeeded vs failed.  Partial success
-        # keeps the layer "ok" but listed endpoints stay in failing_endpoints.
+        # Mark whichever sub-queries succeeded vs failed. Partial success
+        # makes the layer degraded while listed endpoints remain visible.
         for endpoint in graphql_failing:
             # Use a synthetic GraphQL error type for layer-tracking purposes.
             health.record_failure(LAYER_GRAPHQL, endpoint, _NonGrpcError(endpoint))
@@ -992,6 +1005,7 @@ class PolestarCoordinator(DataUpdateCoordinator):
         exterior_by_vin: dict = {}
         availability_by_vin: dict = {}
         health_by_vin: dict = {}
+        software_by_vin: dict = {}
         for vin in vins:
             climate_by_vin[vin] = call_or_keep(
                 LAYER_CEP,
@@ -1014,6 +1028,9 @@ class PolestarCoordinator(DataUpdateCoordinator):
             health_by_vin[vin] = call_or_keep(
                 LAYER_CEP, "health", vin, lambda v=vin: self.cep.get_health(v)
             )
+            software_by_vin[vin] = call_or_keep(
+                LAYER_CEP, "software", vin, lambda v=vin: self.cep.get_mycars(v)
+            )
 
         health.end_cycle()
         return {
@@ -1031,6 +1048,7 @@ class PolestarCoordinator(DataUpdateCoordinator):
             "exterior": _drop_none(exterior_by_vin),
             "availability": _drop_none(availability_by_vin),
             "health": _drop_none(health_by_vin),
+            "software": _drop_none(software_by_vin),
             "api_health": health.to_dict(),
         }
 

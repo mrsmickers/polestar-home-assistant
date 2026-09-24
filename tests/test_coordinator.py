@@ -10,7 +10,9 @@ import grpc
 import pytest
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
+from custom_components.polestar_soc.cep import CepDataError
 from custom_components.polestar_soc.coordinator import (
     LAYER_PCCS,
     PolestarCoordinator,
@@ -59,6 +61,9 @@ def coordinator(hass: HomeAssistant, mock_entry: MagicMock) -> PolestarCoordinat
     coord.cep.get_exterior = MagicMock(return_value={})
     coord.cep.get_availability = MagicMock(return_value={})
     coord.cep.get_health = MagicMock(return_value={})
+    coord.cep.get_mycars = MagicMock(
+        return_value={"vin": VIN, "installed_software_version": "P4.2.11"}
+    )
     return coord
 
 
@@ -125,11 +130,24 @@ class TestDoFetchHappyPath:
         assert result["vehicles"] == [{"vin": VIN}]
         assert result["target_soc"] == {VIN: {"target_soc": 80}}
         assert result["cep_battery"] == {VIN: {"soc": 76.0}}
+        assert result["software"] == {
+            VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}
+        }
         # api_health is present and all layers are ok.
         assert "api_health" in result
         for layer in ("pccs", "cep", "graphql"):
             assert result["api_health"][layer]["status"] == "ok"
             assert result["api_health"][layer]["consecutive_failures"] == 0
+
+    def test_invalid_graphql_vin_fails_before_vehicle_calls(
+        self, coordinator: PolestarCoordinator
+    ):
+        coordinator.api.get_vehicles = MagicMock(return_value=[{"vin": ""}])
+
+        with pytest.raises(UpdateFailed, match="invalid VIN"):
+            coordinator._do_fetch(auth_retry_used=False)
+
+        coordinator.api.get_telematics.assert_not_called()
 
 
 class TestDoFetchAuthRetrySignal:
@@ -218,6 +236,24 @@ class TestDoFetchLastKnownGood:
         result = coordinator._do_fetch(auth_retry_used=True)
         # No data preserved — VIN absent from target_soc dict (sensor goes unavailable).
         assert result["target_soc"] == {}
+
+    def test_mycars_identity_mismatch_preserves_value_and_degrades_health(
+        self, coordinator: PolestarCoordinator
+    ):
+        coordinator.data = {
+            "software": {VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}},
+        }
+        coordinator.cep.get_mycars = MagicMock(
+            side_effect=CepDataError("no exact VIN match")
+        )
+
+        result = coordinator._do_fetch(auth_retry_used=True)
+
+        assert result["software"] == {
+            VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}
+        }
+        assert result["api_health"]["cep"]["status"] == "degraded"
+        assert "software" in result["api_health"]["cep"]["failing_endpoints"]
 
 
 class TestDoFetchWarnOnce:

@@ -52,6 +52,7 @@ from custom_components.polestar_soc.proto import (
     _encode_packed_varints,
     _encode_varint,
     _get_bool,
+    _get_double,
     _get_float,
     _get_int,
     _get_string,
@@ -236,6 +237,22 @@ class TestDecodeMessage:
         with pytest.raises(ValueError, match="Unsupported wire type"):
             _decode_message(data)
 
+    def test_truncated_length_delimited_field_raises(self):
+        with pytest.raises(ValueError, match="Truncated length-delimited"):
+            _decode_message(b"\x0a\x05abc")
+
+    def test_truncated_fixed32_field_raises(self):
+        with pytest.raises(ValueError, match="Truncated fixed32"):
+            _decode_message(b"\x0d\x00\x00")
+
+    def test_truncated_fixed64_field_raises(self):
+        with pytest.raises(ValueError, match="Truncated fixed64"):
+            _decode_message(b"\x09\x00\x00")
+
+    def test_field_zero_raises(self):
+        with pytest.raises(ValueError, match="field number 0"):
+            _decode_message(b"\x00\x00")
+
 
 # ---------------------------------------------------------------------------
 # Helper extractors
@@ -250,6 +267,42 @@ class TestGetInt:
     def test_missing_field_default(self):
         assert _get_int({}, 1) == 0
         assert _get_int({}, 1, 99) == 99
+
+    def test_varint_ignores_later_wrong_wire_type(self):
+        data = (
+            _encode_field_varint(7, 1)
+            + _encode_varint((7 << 3) | 5)
+            + struct.pack("<I", 2)
+        )
+        assert _get_int(_decode_message(data), 7) == 1
+
+    def test_double_ignores_later_varint(self):
+        data = (
+            _encode_varint((2 << 3) | 1)
+            + struct.pack("<d", 76.0)
+            + _encode_field_varint(2, 0)
+        )
+        assert _get_double(_decode_message(data), 2) == pytest.approx(76.0)
+
+    def test_string_ignores_later_varint(self):
+        data = _encode_field_bytes(1, b"value") + _encode_field_varint(1, 0)
+        assert _get_string(_decode_message(data), 1) == "value"
+
+    def test_submessage_ignores_later_varint(self):
+        data = _encode_field_bytes(3, _encode_field_varint(1, 42)) + _encode_field_varint(3, 0)
+        nested = _get_submessage(_decode_message(data), 3)
+        assert nested is not None
+        assert _get_int(nested, 1) == 42
+
+    def test_singular_embedded_messages_merge_in_wire_order(self):
+        outer = _decode_message(
+            _encode_field_bytes(3, _encode_field_varint(1, 10))
+            + _encode_field_bytes(3, _encode_field_varint(2, 20))
+        )
+        merged = _get_submessage(outer, 3)
+        assert merged is not None
+        assert _get_int(merged, 1) == 10
+        assert _get_int(merged, 2) == 20
 
 
 class TestGetBool:
