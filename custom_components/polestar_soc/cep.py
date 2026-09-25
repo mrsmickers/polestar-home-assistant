@@ -197,17 +197,15 @@ def _build_honk_flash_request(vin: str, action: int) -> bytes:
     _require_valid_vin(vin, source="requested")
     if action not in {0, 1, 2}:
         raise ValueError("Invalid honk/flash action")
-    return _encode_field_bytes(
-        1, _build_cep_invocation_request(vin)
-    ) + _encode_field_varint(2, action)
+    return _encode_field_bytes(1, _build_cep_invocation_request(vin)) + _encode_field_varint(
+        2, action
+    )
 
 
 def _build_trunk_unlock_request(vin: str) -> bytes:
     """Build CarUnlockRequest with trunk-only unlock type."""
     _require_valid_vin(vin, source="requested")
-    return _encode_field_bytes(
-        1, _build_cep_invocation_request(vin)
-    ) + _encode_field_varint(2, 1)
+    return _encode_field_bytes(1, _build_cep_invocation_request(vin)) + _encode_field_varint(2, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +237,7 @@ def _parse_mycars_response(data: bytes, vin: str) -> dict:
                 "vin": _get_strict_utf8(details, 1, "VIN"),
                 "model_name": _get_strict_utf8(details, 6, "model name"),
                 "model_year": _get_strict_utf8(details, 7, "model year"),
-                "installed_software_version": _get_strict_utf8(
-                    details, 9, "software version"
-                ),
+                "installed_software_version": _get_strict_utf8(details, 9, "software version"),
                 "market": _get_strict_utf8(details, 10, "market"),
             }
             if entry["vin"] and VIN_PATTERN.fullmatch(entry["vin"]) is None:
@@ -285,17 +281,13 @@ def _parse_charge_locations_response(data: bytes, vin: str) -> list[dict]:
         if not isinstance(raw_location, (bytes, bytearray)):
             raise CepDataError("Charge locations entry has the wrong wire type")
         fields = _decode_message(bytes(raw_location))
-        location_id = _get_strict_utf8(
-            fields, 2, "location ID", source="Charge locations"
-        )
+        location_id = _get_strict_utf8(fields, 2, "location ID", source="Charge locations")
         if not location_id:
             raise CepDataError("Charge locations entry omitted location ID")
         locations.append(
             {
                 "location_id": location_id,
-                "alias": _get_strict_utf8(
-                    fields, 3, "alias", source="Charge locations"
-                ),
+                "alias": _get_strict_utf8(fields, 3, "alias", source="Charge locations"),
                 "amp_limit": _get_optional_int(fields, 5),
                 "minimum_soc": _get_optional_int(fields, 6),
                 "optimised_charging": bool(_get_optional_int(fields, 7)),
@@ -317,9 +309,7 @@ def _parse_current_charge_location_response(data: bytes) -> dict:
         raise CepDataError(f"Current charge location failed with status {status}")
     return {
         "status": status,
-        "location_id": _get_strict_utf8(
-            fields, 2, "location ID", source="Current charge location"
-        ),
+        "location_id": _get_strict_utf8(fields, 2, "location ID", source="Current charge location"),
         "arrived_at": _get_optional_int(fields, 3),
     }
 
@@ -994,9 +984,7 @@ class CepClient:
 
         status = result.get("status", 0)
         if status == 4 and not allow_delivered_on_cancel:
-            raise CepError(
-                f"{command_name} delivered but execution result unavailable"
-            )
+            raise CepError(f"{command_name} delivered but execution result unavailable")
         if status != 6 and not (status == 4 and allow_delivered_on_cancel):
             status_name = INVOCATION_STATUS_MAP.get(status, f"STATUS_{status}")
             server_msg = result.get("message", "")

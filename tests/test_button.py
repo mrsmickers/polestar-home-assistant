@@ -76,9 +76,7 @@ async def test_warm_car_starts_climate_at_22_degrees(sample_vehicle):
         (PolestarUnlockTrunkButton, "unlock_trunk", (VIN,)),
     ),
 )
-async def test_cep_button_calls_expected_command(
-    button_class, method_name, args, sample_vehicle
-):
+async def test_cep_button_calls_expected_command(button_class, method_name, args, sample_vehicle):
     button = _make_button(button_class, sample_vehicle)
 
     await button.async_press()

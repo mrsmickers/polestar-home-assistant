@@ -209,17 +209,11 @@ class TestLayerHealthWarnOnce:
         assert "parked_location" in message
         assert "backend-sensitive-detail" not in message
 
-    def test_non_grpc_warning_omits_exception_detail(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_non_grpc_warning_omits_exception_detail(self, caplog: pytest.LogCaptureFixture):
         h = _LayerHealth()
-        with caplog.at_level(
-            logging.WARNING, logger="custom_components.polestar_soc.coordinator"
-        ):
+        with caplog.at_level(logging.WARNING, logger="custom_components.polestar_soc.coordinator"):
             h.start_cycle()
-            h.record_failure(
-                LAYER_CEP, "parked_location", ValueError("backend-sensitive-detail")
-            )
+            h.record_failure(LAYER_CEP, "parked_location", ValueError("backend-sensitive-detail"))
             h.end_cycle()
         message = " ".join(record.getMessage() for record in caplog.records)
         assert "NON_GRPC_ERROR" in message

@@ -139,15 +139,11 @@ class TestDoFetchHappyPath:
         assert result["vehicles"] == [{"vin": VIN}]
         assert result["target_soc"] == {VIN: {"target_soc": 80}}
         assert result["cep_battery"] == {VIN: {"soc": 76.0}}
-        assert result["software"] == {
-            VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}
-        }
+        assert result["software"] == {VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}}
         assert result["parked_location"] == {
             VIN: {"latitude": 59.3, "longitude": 18.0, "timestamp_ms": 1234}
         }
-        assert result["charge_locations"] == {
-            VIN: [{"location_id": "home-id", "alias": "Home"}]
-        }
+        assert result["charge_locations"] == {VIN: [{"location_id": "home-id", "alias": "Home"}]}
         assert result["current_charge_location"] == {
             VIN: {"status": 1, "location_id": "home-id", "arrived_at": 1234}
         }
@@ -157,9 +153,7 @@ class TestDoFetchHappyPath:
             assert result["api_health"][layer]["status"] == "ok"
             assert result["api_health"][layer]["consecutive_failures"] == 0
 
-    def test_invalid_graphql_vin_fails_before_vehicle_calls(
-        self, coordinator: PolestarCoordinator
-    ):
+    def test_invalid_graphql_vin_fails_before_vehicle_calls(self, coordinator: PolestarCoordinator):
         coordinator.api.get_vehicles = MagicMock(return_value=[{"vin": ""}])
 
         with pytest.raises(UpdateFailed, match="invalid VIN"):
@@ -239,9 +233,7 @@ class TestDoFetchAuthRetrySignal:
 
         coordinator.cep.get_parked_location = MagicMock(side_effect=BrokenCode())
 
-        with caplog.at_level(
-            logging.WARNING, logger="custom_components.polestar_soc.coordinator"
-        ):
+        with caplog.at_level(logging.WARNING, logger="custom_components.polestar_soc.coordinator"):
             result = coordinator._do_fetch(auth_retry_used=False)
 
         assert result["api_health"]["cep"]["last_code"] == "RPC_ERROR"
@@ -280,15 +272,11 @@ class TestDoFetchLastKnownGood:
         coordinator.data = {
             "software": {VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}},
         }
-        coordinator.cep.get_mycars = MagicMock(
-            side_effect=CepDataError("no exact VIN match")
-        )
+        coordinator.cep.get_mycars = MagicMock(side_effect=CepDataError("no exact VIN match"))
 
         result = coordinator._do_fetch(auth_retry_used=True)
 
-        assert result["software"] == {
-            VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}
-        }
+        assert result["software"] == {VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}}
         assert result["api_health"]["cep"]["status"] == "degraded"
         assert "software" in result["api_health"]["cep"]["failing_endpoints"]
 

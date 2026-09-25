@@ -269,19 +269,11 @@ class TestGetInt:
         assert _get_int({}, 1, 99) == 99
 
     def test_varint_ignores_later_wrong_wire_type(self):
-        data = (
-            _encode_field_varint(7, 1)
-            + _encode_varint((7 << 3) | 5)
-            + struct.pack("<I", 2)
-        )
+        data = _encode_field_varint(7, 1) + _encode_varint((7 << 3) | 5) + struct.pack("<I", 2)
         assert _get_int(_decode_message(data), 7) == 1
 
     def test_double_ignores_later_varint(self):
-        data = (
-            _encode_varint((2 << 3) | 1)
-            + struct.pack("<d", 76.0)
-            + _encode_field_varint(2, 0)
-        )
+        data = _encode_varint((2 << 3) | 1) + struct.pack("<d", 76.0) + _encode_field_varint(2, 0)
         assert _get_double(_decode_message(data), 2) == pytest.approx(76.0)
 
     def test_string_ignores_later_varint(self):
