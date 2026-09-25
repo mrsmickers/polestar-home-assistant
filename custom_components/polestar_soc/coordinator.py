@@ -51,8 +51,8 @@ _ALL_LAYERS = (LAYER_PCCS, LAYER_CEP, LAYER_GRAPHQL)
 
 # gRPC status codes that indicate the token was rejected by the backend
 # and warrant a single refresh-and-retry attempt.
-_AUTH_GRPC_CODES: frozenset[grpc.StatusCode] = frozenset(
-    {grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNAUTHENTICATED}
+_AUTH_GRPC_CODE_NAMES: frozenset[str] = frozenset(
+    {grpc.StatusCode.PERMISSION_DENIED.name, grpc.StatusCode.UNAUTHENTICATED.name}
 )
 
 # Sentinel returned by the per-call wrapper to mark "call failed" so the
@@ -165,12 +165,12 @@ class _LayerHealth:
         code = _classify_error(err)
         state["last_code"] = code
 
-        msg = "%s call %s failed: %s (%s)"
+        msg = "%s call %s failed: %s"
         if code in state["_warned_codes"]:
-            _LOGGER.debug(msg, layer, endpoint, code, err)
+            _LOGGER.debug(msg, layer, endpoint, code)
         else:
             state["_warned_codes"].add(code)
-            _LOGGER.warning(msg, layer, endpoint, code, err)
+            _LOGGER.warning(msg, layer, endpoint, code)
 
         return code
 
@@ -207,10 +207,10 @@ def _classify_error(err: BaseException) -> str:
             code = err.code()
         except Exception:
             return "RPC_ERROR"
-        if code is None:
+        if not isinstance(code, grpc.StatusCode):
             return "RPC_ERROR"
         return code.name
-    return type(err).__name__
+    return "NON_GRPC_ERROR"
 
 
 def _drop_none(d: dict) -> dict:
@@ -791,8 +791,7 @@ class PolestarCoordinator(DataUpdateCoordinator):
             except Exception:
                 _LOGGER.warning(
                     "PCCS token refresh failed; PCCS sensors will be unavailable "
-                    "until the integration is reconfigured",
-                    exc_info=True,
+                    "until the integration is reconfigured"
                 )
         self._update_stored_tokens()
 
@@ -870,14 +869,14 @@ class PolestarCoordinator(DataUpdateCoordinator):
             except _GrpcAuthError:
                 raise
             except grpc.RpcError as err:
-                health.record_failure(layer, endpoint, err)
-                if not retry_used[0] and err.code() in _AUTH_GRPC_CODES:
+                code = health.record_failure(layer, endpoint, err)
+                if not retry_used[0] and code in _AUTH_GRPC_CODE_NAMES:
                     retry_used[0] = True
                     raise _GrpcAuthError(layer) from err
                 return _FAILED
             except Exception:
-                _LOGGER.debug("Failed %s/%s (non-gRPC)", layer, endpoint, exc_info=True)
-                health.record_failure(layer, endpoint, _NonGrpcError(f"{layer}/{endpoint}"))
+                _LOGGER.debug("Failed %s/%s: NON_GRPC_ERROR", layer, endpoint)
+                health.record_failure(layer, endpoint, _NonGrpcError())
                 return _FAILED
             health.record_success(layer, endpoint)
             return result
@@ -917,6 +916,9 @@ class PolestarCoordinator(DataUpdateCoordinator):
                 "climate": {},
                 "cep_battery": {},
                 "location": {},
+                "parked_location": {},
+                "charge_locations": {},
+                "current_charge_location": {},
                 "exterior": {},
                 "availability": {},
                 "health": {},
@@ -1002,6 +1004,9 @@ class PolestarCoordinator(DataUpdateCoordinator):
         climate_by_vin: dict = {}
         cep_battery_by_vin: dict = {}
         location_by_vin: dict = {}
+        parked_location_by_vin: dict = {}
+        charge_locations_by_vin: dict = {}
+        current_charge_location_by_vin: dict = {}
         exterior_by_vin: dict = {}
         availability_by_vin: dict = {}
         health_by_vin: dict = {}
@@ -1018,6 +1023,24 @@ class PolestarCoordinator(DataUpdateCoordinator):
             )
             location_by_vin[vin] = call_or_keep(
                 LAYER_CEP, "location", vin, lambda v=vin: self.cep.get_location(v)
+            )
+            parked_location_by_vin[vin] = call_or_keep(
+                LAYER_CEP,
+                "parked_location",
+                vin,
+                lambda v=vin: self.cep.get_parked_location(v),
+            )
+            charge_locations_by_vin[vin] = call_or_keep(
+                LAYER_CEP,
+                "charge_locations",
+                vin,
+                lambda v=vin: self.cep.get_charge_locations(v),
+            )
+            current_charge_location_by_vin[vin] = call_or_keep(
+                LAYER_CEP,
+                "current_charge_location",
+                vin,
+                lambda v=vin: self.cep.get_current_charge_location(v),
             )
             exterior_by_vin[vin] = call_or_keep(
                 LAYER_CEP, "exterior", vin, lambda v=vin: self.cep.get_exterior(v)
@@ -1045,6 +1068,9 @@ class PolestarCoordinator(DataUpdateCoordinator):
             "climate": _drop_none(climate_by_vin),
             "cep_battery": _drop_none(cep_battery_by_vin),
             "location": _drop_none(location_by_vin),
+            "parked_location": _drop_none(parked_location_by_vin),
+            "charge_locations": _drop_none(charge_locations_by_vin),
+            "current_charge_location": _drop_none(current_charge_location_by_vin),
             "exterior": _drop_none(exterior_by_vin),
             "availability": _drop_none(availability_by_vin),
             "health": _drop_none(health_by_vin),

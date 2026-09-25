@@ -28,6 +28,7 @@ async def async_setup_entry(
     for vehicle in coordinator.data.get("vehicles", []):
         vin = vehicle["vin"]
         entities.append(PolestarDeviceTracker(coordinator, vehicle, vin))
+        entities.append(PolestarParkedDeviceTracker(coordinator, vehicle, vin))
 
     async_add_entities(entities)
 
@@ -97,3 +98,24 @@ class PolestarDeviceTracker(CoordinatorEntity[PolestarCoordinator], TrackerEntit
         return {
             "location_timestamp": datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).isoformat(),
         }
+
+
+class PolestarParkedDeviceTracker(PolestarDeviceTracker):
+    """Vehicle's last parked GPS location."""
+
+    _attr_translation_key = "parked_location"
+
+    def __init__(
+        self,
+        coordinator: PolestarCoordinator,
+        vehicle: dict,
+        vin: str,
+    ) -> None:
+        super().__init__(coordinator, vehicle, vin)
+        self._attr_unique_id = f"{vin}_parked_location"
+
+    def _location_data(self) -> dict | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        return data.get("parked_location", {}).get(self._vin)

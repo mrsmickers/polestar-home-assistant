@@ -5,7 +5,10 @@ from unittest.mock import MagicMock
 from homeassistant.components.device_tracker import SourceType
 
 from custom_components.polestar_soc.const import DOMAIN
-from custom_components.polestar_soc.device_tracker import PolestarDeviceTracker
+from custom_components.polestar_soc.device_tracker import (
+    PolestarDeviceTracker,
+    PolestarParkedDeviceTracker,
+)
 
 VIN = "YSMYKEAE1RB000001"
 
@@ -69,6 +72,33 @@ class TestPolestarDeviceTracker:
             "timestamp_ms": None,
         }
         tracker = _make_tracker(sample_coordinator_data, sample_vehicle, VIN)
+        assert tracker.latitude is None
+        assert tracker.longitude is None
+        assert tracker.extra_state_attributes is None
+
+
+class TestPolestarParkedDeviceTracker:
+    def test_uses_parked_location_data(self, sample_coordinator_data, sample_vehicle):
+        sample_coordinator_data["parked_location"] = {
+            VIN: {"latitude": 50.8, "longitude": -0.1, "timestamp_ms": 1772990058845}
+        }
+        coordinator = MagicMock()
+        coordinator.data = sample_coordinator_data
+        tracker = PolestarParkedDeviceTracker(coordinator, sample_vehicle, VIN)
+
+        assert tracker.latitude == 50.8
+        assert tracker.longitude == -0.1
+        assert tracker.unique_id == f"{VIN}_parked_location"
+        assert tracker.translation_key == "parked_location"
+        assert tracker.extra_state_attributes == {
+            "location_timestamp": "2026-03-08T17:14:18.845000+00:00"
+        }
+
+    def test_unavailable_without_parked_location(self, sample_coordinator_data, sample_vehicle):
+        coordinator = MagicMock()
+        coordinator.data = sample_coordinator_data
+        tracker = PolestarParkedDeviceTracker(coordinator, sample_vehicle, VIN)
+
         assert tracker.latitude is None
         assert tracker.longitude is None
         assert tracker.extra_state_attributes is None

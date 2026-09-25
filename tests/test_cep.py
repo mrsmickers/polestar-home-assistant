@@ -1,24 +1,42 @@
 """Tests for CEP gRPC client protobuf parsers and request builder."""
 
 import struct
+from unittest.mock import MagicMock
 
+import grpc
 import pytest
 
 from custom_components.polestar_soc.cep import (
+    _METHOD_CEP_UNLOCK,
+    _METHOD_CHARGE_NOW_START,
+    _METHOD_CHARGE_NOW_STOP,
+    _METHOD_GET_CHARGE_LOCATIONS,
+    _METHOD_GET_CURRENT_CHARGE_LOCATION,
     _METHOD_GET_MYCARS,
+    _METHOD_GET_PARKED_LOCATION,
+    _METHOD_HONK_FLASH,
+    CepClient,
     CepDataError,
+    CepError,
+    _build_charge_now_request,
     _build_get_mycars_request,
+    _build_honk_flash_request,
     _build_location_request,
+    _build_trunk_unlock_request,
     _build_vin_request,
     _format_climate_status,
     _format_heating_intensity,
     _parse_availability_response,
     _parse_battery_response,
+    _parse_charge_locations_response,
+    _parse_charge_now_response,
     _parse_climate_response,
+    _parse_current_charge_location_response,
     _parse_exterior_response,
     _parse_health_response,
     _parse_location_response,
     _parse_mycars_response,
+    _parse_parked_location_response,
 )
 from custom_components.polestar_soc.proto import (
     _decode_message,
@@ -33,6 +51,8 @@ from custom_components.polestar_soc.sensor import (
     _charging_time_remaining,
     _software_version,
 )
+
+from .conftest import make_rpc_error
 
 # Synthetic test payloads built with a fake VIN.
 # ParkingClimatization: climate off, all seat heaters off
@@ -66,6 +86,278 @@ class TestBuildVinRequest:
         # Should be: tag(field 2, wire type 2) + varint(len) + VIN bytes
         expected = _encode_field_bytes(2, TEST_VIN.encode("utf-8"))
         assert result == expected
+
+
+class TestChargeNow:
+    def test_service_paths(self):
+        assert _METHOD_CHARGE_NOW_START == (
+            "/chronos.services.v1.ChargeNowService/StartOverrideChargeTimer"
+        )
+        assert _METHOD_CHARGE_NOW_STOP == (
+            "/chronos.services.v1.ChargeNowService/StopOverrideChargeTimer"
+        )
+
+    def test_request_wraps_chronos_identity(self):
+        request = _decode_message(_build_charge_now_request(TEST_VIN))
+        chronos = _get_submessage(request, 1)
+        assert chronos is not None
+        assert chronos[2][-1] == TEST_VIN.encode()
+        assert chronos[3][-1] == b"RCS"
+
+    def test_response_status_is_direct_field_one(self):
+        response = _encode_field_varint(1, 1)
+        assert _parse_charge_now_response(response) == 1
+
+    @pytest.mark.parametrize("status", (0, 2, 3, 4))
+    def test_error_statuses_are_not_success(self, status):
+        response = _encode_field_varint(1, status)
+        assert _parse_charge_now_response(response) == status
+
+    def test_missing_payload_is_failure(self):
+        with pytest.raises(CepDataError, match="missing status"):
+            _parse_charge_now_response(b"")
+
+
+class TestChargeLocations:
+    def test_service_paths(self):
+        assert _METHOD_GET_CHARGE_LOCATIONS == (
+            "/chronos.services.v1.ChargeLocationService/GetChargeLocations"
+        )
+        assert _METHOD_GET_CURRENT_CHARGE_LOCATION == (
+            "/chronos.services.v1.ChargeLocationService/isAtALocation"
+        )
+
+    def test_parse_saved_locations(self):
+        location = b"".join(
+            (
+                _encode_field_bytes(2, b"home-id"),
+                _encode_field_bytes(3, b"Home"),
+                _encode_field_varint(5, 16),
+                _encode_field_varint(6, 20),
+                _encode_field_varint(7, 1),
+                _encode_field_varint(8, 0),
+                _encode_field_varint(9, 2),
+                _encode_field_varint(12, 1),
+            )
+        )
+        response = _encode_field_bytes(2, TEST_VIN.encode()) + _encode_field_bytes(3, location)
+
+        assert _parse_charge_locations_response(response, TEST_VIN) == [
+            {
+                "location_id": "home-id",
+                "alias": "Home",
+                "amp_limit": 16,
+                "minimum_soc": 20,
+                "optimised_charging": True,
+                "bidirectional_charging": False,
+                "available_optimised_charging": 2,
+                "location_type": 1,
+            }
+        ]
+
+    def test_parse_current_location(self):
+        response = b"".join(
+            (
+                _encode_field_varint(1, 1),
+                _encode_field_bytes(2, b"home-id"),
+                _encode_field_varint(3, 1772990058),
+            )
+        )
+        assert _parse_current_charge_location_response(response) == {
+            "status": 1,
+            "location_id": "home-id",
+            "arrived_at": 1772990058,
+        }
+
+    def test_success_with_empty_location_means_not_at_saved_location(self):
+        assert _parse_current_charge_location_response(_encode_field_varint(1, 1)) == {
+            "status": 1,
+            "location_id": "",
+            "arrived_at": None,
+        }
+
+    @pytest.mark.parametrize("status", (0, 2, 3, 4))
+    def test_current_location_rejects_error_status(self, status):
+        response = _encode_field_varint(1, status) + _encode_field_bytes(2, b"home-id")
+        with pytest.raises(CepDataError, match=f"status {status}"):
+            _parse_current_charge_location_response(response)
+
+    def test_current_location_rejects_missing_status(self):
+        with pytest.raises(CepDataError, match="missing status"):
+            _parse_current_charge_location_response(b"")
+
+    def test_malformed_location_is_rejected(self):
+        location = _encode_field_bytes(2, b"\xff")
+        with pytest.raises(CepDataError, match="invalid UTF-8"):
+            _parse_charge_locations_response(
+                _encode_field_bytes(2, TEST_VIN.encode()) + _encode_field_bytes(3, location),
+                TEST_VIN,
+            )
+
+    @pytest.mark.parametrize("response_vin", ("", "WVWZZZ1JZXW000001"))
+    def test_saved_locations_reject_missing_or_mismatched_vin(self, response_vin):
+        response = _encode_field_bytes(2, response_vin.encode())
+        with pytest.raises(CepDataError, match="VIN"):
+            _parse_charge_locations_response(response, TEST_VIN)
+
+
+class TestRemoteInvocationBuilders:
+    def test_service_paths(self):
+        assert _METHOD_HONK_FLASH == "/invocation.InvocationService/HonkFlash"
+        assert _METHOD_CEP_UNLOCK == "/invocation.InvocationService/Unlock"
+
+    @pytest.mark.parametrize("action", (0, 1, 2))
+    def test_honk_flash_request(self, action):
+        request = _decode_message(_build_honk_flash_request(TEST_VIN, action))
+        invocation = _get_submessage(request, 1)
+        assert invocation is not None
+        assert invocation[1][-1] == TEST_VIN.encode()
+        assert int(request[2][-1]) == action
+
+    def test_trunk_unlock_request(self):
+        request = _decode_message(_build_trunk_unlock_request(TEST_VIN))
+        invocation = _get_submessage(request, 1)
+        assert invocation is not None
+        assert invocation[1][-1] == TEST_VIN.encode()
+        assert int(request[2][-1]) == 1
+
+    def test_rejects_invalid_honk_action(self):
+        with pytest.raises(ValueError, match="honk/flash action"):
+            _build_honk_flash_request(TEST_VIN, 3)
+
+
+class TestCepClientRemoteCommands:
+    @staticmethod
+    def _client() -> tuple[CepClient, MagicMock]:
+        client = CepClient("read-token", "write-token")
+        channel = MagicMock()
+        client._channel = channel
+        return client, channel
+
+    def test_start_charging_uses_write_token_and_expected_rpc(self):
+        client, channel = self._client()
+        rpc = MagicMock(return_value=_encode_field_varint(1, 1))
+        channel.unary_unary.return_value = rpc
+
+        assert client.start_charging(TEST_VIN) == {"status": 1}
+
+        channel.unary_unary.assert_called_once()
+        assert channel.unary_unary.call_args.args[0] == _METHOD_CHARGE_NOW_START
+        assert ("authorization", "Bearer write-token") in rpc.call_args.kwargs["metadata"]
+
+    @pytest.mark.parametrize("status", (0, 2, 3, 4))
+    def test_start_charging_rejects_every_error_status(self, status):
+        client, channel = self._client()
+        channel.unary_unary.return_value = MagicMock(return_value=_encode_field_varint(1, status))
+
+        with pytest.raises(CepError, match=f"status {status}"):
+            client.start_charging(TEST_VIN)
+
+    def test_parked_location_uses_read_token(self):
+        client, channel = self._client()
+        response = _build_parked_location_payload(
+            TEST_VIN, longitude=18.0, latitude=50.8, timestamp_ms=1772990058845
+        )
+        rpc = MagicMock(return_value=response)
+        channel.unary_unary.return_value = rpc
+
+        result = client.get_parked_location(TEST_VIN)
+
+        assert result["latitude"] == pytest.approx(50.8)
+        assert channel.unary_unary.call_args.args[0] == _METHOD_GET_PARKED_LOCATION
+        assert ("authorization", "Bearer read-token") in rpc.call_args.kwargs["metadata"]
+
+    def test_parked_location_log_sanitises_grpc_details(self, caplog):
+        client, channel = self._client()
+        rpc = MagicMock(
+            side_effect=make_rpc_error(grpc.StatusCode.UNAVAILABLE, "backend-sensitive-detail")
+        )
+        channel.unary_unary.return_value = rpc
+
+        with (
+            caplog.at_level("DEBUG", logger="custom_components.polestar_soc.cep"),
+            pytest.raises(grpc.RpcError),
+        ):
+            client.get_parked_location(TEST_VIN)
+
+        messages = " ".join(record.getMessage() for record in caplog.records)
+        assert "UNAVAILABLE" in messages
+        assert "backend-sensitive-detail" not in messages
+
+    def test_flash_lights_uses_streaming_invocation(self):
+        client, channel = self._client()
+        inner = _encode_field_bytes(2, TEST_VIN.encode()) + _encode_field_varint(3, 6)
+        invocation = _encode_field_bytes(1, inner)
+        rpc = MagicMock(return_value=iter([invocation]))
+        channel.unary_stream.return_value = rpc
+
+        result = client.honk_flash(TEST_VIN, 2)
+
+        assert result["status"] == 6
+        assert channel.unary_stream.call_args.args[0] == _METHOD_HONK_FLASH
+        assert ("authorization", "Bearer write-token") in rpc.call_args.kwargs["metadata"]
+
+    def test_flash_delivery_without_terminal_success_is_indeterminate(self):
+        client, channel = self._client()
+        delivered = _encode_field_bytes(1, _encode_field_varint(3, 4))
+
+        def cancelled_stream():
+            yield delivered
+            raise make_rpc_error(grpc.StatusCode.CANCELLED)
+
+        channel.unary_stream.return_value = MagicMock(return_value=cancelled_stream())
+
+        with pytest.raises(CepError, match="execution result unavailable") as exc_info:
+            client.honk_flash(TEST_VIN, 2)
+
+        assert exc_info.value.__cause__ is None
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        (
+            ("honk_flash", (TEST_VIN, 2)),
+            ("unlock_trunk", (TEST_VIN,)),
+        ),
+    )
+    def test_security_controls_reject_delivered_only_normal_end(self, method_name, args):
+        client, channel = self._client()
+        delivered = _encode_field_bytes(1, _encode_field_varint(3, 4))
+        channel.unary_stream.return_value = MagicMock(return_value=iter([delivered]))
+
+        with pytest.raises(CepError, match="execution result unavailable"):
+            getattr(client, method_name)(*args)
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        (
+            ("honk_flash", (TEST_VIN, 2)),
+            ("unlock_trunk", (TEST_VIN,)),
+        ),
+    )
+    def test_security_controls_reject_success_for_another_vin(self, method_name, args):
+        client, channel = self._client()
+        inner = _encode_field_bytes(2, b"WVWZZZ1JZXW000001")
+        inner += _encode_field_varint(3, 6)
+        invocation = _encode_field_bytes(1, inner)
+        channel.unary_stream.return_value = MagicMock(return_value=iter([invocation]))
+
+        with pytest.raises(CepDataError, match="VIN"):
+            getattr(client, method_name)(*args)
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        (
+            ("honk_flash", (TEST_VIN, 2)),
+            ("unlock_trunk", (TEST_VIN,)),
+        ),
+    )
+    def test_security_controls_reject_success_without_vin(self, method_name, args):
+        client, channel = self._client()
+        invocation = _encode_field_bytes(1, _encode_field_varint(3, 6))
+        channel.unary_stream.return_value = MagicMock(return_value=iter([invocation]))
+
+        with pytest.raises(CepDataError, match="VIN"):
+            getattr(client, method_name)(*args)
 
 
 class TestMyCars:
@@ -182,9 +474,9 @@ class TestMyCars:
             _parse_mycars_response(payload, TEST_VIN)
 
     def test_parser_rejects_duplicate_entries_for_requested_vin(self):
-        payload = _encode_field_bytes(
-            1, self._entry(TEST_VIN, "P4.2.10")
-        ) + _encode_field_bytes(1, self._entry(TEST_VIN, "P4.2.11"))
+        payload = _encode_field_bytes(1, self._entry(TEST_VIN, "P4.2.10")) + _encode_field_bytes(
+            1, self._entry(TEST_VIN, "P4.2.11")
+        )
         with pytest.raises(CepDataError, match="duplicate entries"):
             _parse_mycars_response(payload, TEST_VIN)
 
@@ -243,20 +535,12 @@ class TestParseBatteryResponse:
         assert result["charging_type"] == 1  # NONE (not charging)
 
     def test_soc_ignores_later_wrong_wire_varint(self):
-        state = (
-            _encode_varint((2 << 3) | 1)
-            + struct.pack("<d", 76.0)
-            + _encode_field_varint(2, 0)
-        )
+        state = _encode_varint((2 << 3) | 1) + struct.pack("<d", 76.0) + _encode_field_varint(2, 0)
         result = _parse_battery_response(_encode_field_bytes(3, state))
         assert result["soc"] == pytest.approx(76.0)
 
     def test_charging_status_ignores_later_wrong_wire_fixed32(self):
-        state = (
-            _encode_field_varint(7, 1)
-            + _encode_varint((7 << 3) | 5)
-            + struct.pack("<I", 2)
-        )
+        state = _encode_field_varint(7, 1) + _encode_varint((7 << 3) | 5) + struct.pack("<I", 2)
         result = _parse_battery_response(_encode_field_bytes(3, state))
         assert result["charging_status"] == 1
         assert result["raw_fields"][7] == 1
@@ -387,6 +671,20 @@ class TestFormatHeatingIntensity:
         assert result == "Unknown (42)"
 
 
+def _build_parked_location_payload(
+    vin: str, longitude: float, latitude: float, timestamp_ms: int
+) -> bytes:
+    """Build the APK-native LastParkedLocation response wire shape."""
+    seconds, millis = divmod(timestamp_ms, 1000)
+    timestamp = _encode_field_varint(1, seconds)
+    if millis:
+        timestamp += _encode_field_varint(2, millis * 1_000_000)
+    location = struct.pack("<B", (1 << 3) | 1) + struct.pack("<d", longitude)
+    location += struct.pack("<B", (2 << 3) | 1) + struct.pack("<d", latitude)
+    location += _encode_field_bytes(3, timestamp)
+    return _encode_field_bytes(1, vin.encode()) + _encode_field_bytes(2, location)
+
+
 def _build_location_payload(
     vin: str, longitude: float, latitude: float, timestamp_ms: int
 ) -> bytes:
@@ -407,6 +705,11 @@ LOCATION_PAYLOAD = _build_location_payload(
 
 
 class TestBuildLocationRequest:
+    def test_parked_location_service_path(self):
+        assert _METHOD_GET_PARKED_LOCATION == (
+            "/dtlinternet.DtlInternetService/GetLastParkedLocation"
+        )
+
     def test_produces_field_1_string(self):
         result = _build_location_request(TEST_VIN)
         fields = _decode_message(result)
@@ -422,24 +725,27 @@ class TestBuildLocationRequest:
 
 class TestParseLocationResponse:
     def test_parsed_response(self):
-        result = _parse_location_response(LOCATION_PAYLOAD)
+        result = _parse_location_response(LOCATION_PAYLOAD, TEST_VIN)
         assert result["latitude"] == pytest.approx(59.329323)
         assert result["longitude"] == pytest.approx(18.068581)
         assert result["timestamp_ms"] == 1772990058845
 
-    def test_empty_response(self):
-        result = _parse_location_response(b"")
-        assert result["latitude"] is None
-        assert result["longitude"] is None
-        assert result["timestamp_ms"] is None
+    def test_empty_response_is_rejected(self):
+        with pytest.raises(CepDataError, match="VIN"):
+            _parse_location_response(b"", TEST_VIN)
 
     def test_missing_coordinates(self):
         """Response with only VIN returns None values."""
         data = _encode_field_bytes(1, TEST_VIN.encode("utf-8"))
-        result = _parse_location_response(data)
+        result = _parse_location_response(data, TEST_VIN)
         assert result["latitude"] is None
         assert result["longitude"] is None
         assert result["timestamp_ms"] is None
+
+    def test_mismatched_vin_is_rejected(self):
+        data = _encode_field_bytes(1, b"WVWZZZ1JZXW000001")
+        with pytest.raises(CepDataError, match="VIN"):
+            _parse_location_response(data, TEST_VIN)
 
     def test_top_level_decode(self):
         """Verify location fields are at top level (no envelope nesting)."""
@@ -449,6 +755,55 @@ class TestParseLocationResponse:
         assert 2 in fields
         assert 3 in fields
         assert 4 in fields
+
+
+class TestParseParkedLocationResponse:
+    def test_native_nested_wire_shape(self):
+        payload = _build_parked_location_payload(
+            TEST_VIN,
+            longitude=18.068581,
+            latitude=59.329323,
+            timestamp_ms=1772990058845,
+        )
+
+        result = _parse_parked_location_response(payload, TEST_VIN)
+
+        assert result["longitude"] == pytest.approx(18.068581)
+        assert result["latitude"] == pytest.approx(59.329323)
+        assert result["timestamp_ms"] == 1772990058845
+
+    def test_missing_nested_location_is_not_a_successful_empty_fix(self):
+        payload = _encode_field_bytes(1, TEST_VIN.encode())
+        with pytest.raises(CepDataError, match="location"):
+            _parse_parked_location_response(payload, TEST_VIN)
+
+    def test_mismatched_vin_is_rejected(self):
+        payload = _build_parked_location_payload("WVWZZZ1JZXW000001", 18.0, 50.8, 1772990058845)
+        with pytest.raises(CepDataError, match="VIN"):
+            _parse_parked_location_response(payload, TEST_VIN)
+
+    @pytest.mark.parametrize(
+        ("longitude", "latitude"),
+        (
+            (float("nan"), 50.8),
+            (float("inf"), 50.8),
+            (18.0, float("nan")),
+            (18.0, float("-inf")),
+            (181.0, 50.8),
+            (-181.0, 50.8),
+            (18.0, 91.0),
+            (18.0, -91.0),
+        ),
+    )
+    def test_invalid_coordinates_are_rejected(self, longitude, latitude):
+        payload = _build_parked_location_payload(TEST_VIN, longitude, latitude, 1772990058845)
+        with pytest.raises(CepDataError, match="coordinates"):
+            _parse_parked_location_response(payload, TEST_VIN)
+
+    def test_unrepresentable_timestamp_is_rejected(self):
+        payload = _build_parked_location_payload(TEST_VIN, 18.0, 50.8, (2**64 - 1) * 1000)
+        with pytest.raises(CepDataError, match="timestamp"):
+            _parse_parked_location_response(payload, TEST_VIN)
 
 
 def _build_exterior_state(field_values: dict[int, int]) -> bytes:

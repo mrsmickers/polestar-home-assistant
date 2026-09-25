@@ -38,6 +38,7 @@ class PolestarSensorDescription(SensorEntityDescription):
     """Describe a Polestar sensor."""
 
     value_fn: Callable[[dict, str], object]
+    attrs_fn: Callable[[dict, str], dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +267,28 @@ def _software_version(data: dict, vin: str) -> str | None:
     return software.get("installed_software_version") or None
 
 
+def _charge_location_name(data: dict, vin: str) -> str | None:
+    current = data.get("current_charge_location", {}).get(vin) or {}
+    location_id = current.get("location_id")
+    if not location_id:
+        return None
+    for location in data.get("charge_locations", {}).get(vin) or []:
+        if location.get("location_id") == location_id:
+            return location.get("alias") or location_id
+    return location_id
+
+
+def _charge_location_attributes(data: dict, vin: str) -> dict:
+    current = data.get("current_charge_location", {}).get(vin) or {}
+    locations = list(data.get("charge_locations", {}).get(vin) or [])
+    return {
+        "current_location_id": current.get("location_id") or None,
+        "arrived_at": current.get("arrived_at"),
+        "saved_location_count": len(locations),
+        "saved_locations": locations,
+    }
+
+
 # Options lists for ENUM sensors
 _CLIMATE_STATUS_OPTIONS = list(CLIMATE_RUNNING_STATUS_MAP.values())
 _HEATING_INTENSITY_OPTIONS = list(HEATING_INTENSITY_MAP.values())
@@ -280,6 +303,13 @@ SENSOR_DESCRIPTIONS: tuple[PolestarSensorDescription, ...] = (
         translation_key="software_version",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=_software_version,
+    ),
+    PolestarSensorDescription(
+        key="charge_location",
+        translation_key="charge_location",
+        icon="mdi:map-marker-radius",
+        value_fn=_charge_location_name,
+        attrs_fn=_charge_location_attributes,
     ),
     PolestarSensorDescription(
         key="battery_soc",
@@ -523,6 +553,14 @@ class PolestarSensor(CoordinatorEntity[PolestarCoordinator], SensorEntity):
         if not data:
             return None
         return self.entity_description.value_fn(data, self._vin)
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        """Return optional entity-specific attributes."""
+        data = self.coordinator.data
+        if not data or self.entity_description.attrs_fn is None:
+            return None
+        return self.entity_description.attrs_fn(data, self._vin)
 
 
 _API_HEALTH_OPTIONS = ["ok", "degraded", "down"]
