@@ -58,6 +58,15 @@ def coordinator(hass: HomeAssistant, mock_entry: MagicMock) -> PolestarCoordinat
     coord.cep.get_parking_climatization = MagicMock(return_value={})
     coord.cep.get_battery = MagicMock(return_value={"soc": 76.0})
     coord.cep.get_location = MagicMock(return_value={})
+    coord.cep.get_parked_location = MagicMock(
+        return_value={"latitude": 59.3, "longitude": 18.0, "timestamp_ms": 1234}
+    )
+    coord.cep.get_charge_locations = MagicMock(
+        return_value=[{"location_id": "home-id", "alias": "Home"}]
+    )
+    coord.cep.get_current_charge_location = MagicMock(
+        return_value={"status": 1, "location_id": "home-id", "arrived_at": 1234}
+    )
     coord.cep.get_exterior = MagicMock(return_value={})
     coord.cep.get_availability = MagicMock(return_value={})
     coord.cep.get_health = MagicMock(return_value={})
@@ -132,6 +141,15 @@ class TestDoFetchHappyPath:
         assert result["cep_battery"] == {VIN: {"soc": 76.0}}
         assert result["software"] == {
             VIN: {"vin": VIN, "installed_software_version": "P4.2.11"}
+        }
+        assert result["parked_location"] == {
+            VIN: {"latitude": 59.3, "longitude": 18.0, "timestamp_ms": 1234}
+        }
+        assert result["charge_locations"] == {
+            VIN: [{"location_id": "home-id", "alias": "Home"}]
+        }
+        assert result["current_charge_location"] == {
+            VIN: {"status": 1, "location_id": "home-id", "arrived_at": 1234}
         }
         # api_health is present and all layers are ok.
         assert "api_health" in result
@@ -211,6 +229,25 @@ class TestDoFetchAuthRetrySignal:
         with pytest.raises(_GrpcAuthError) as exc_info:
             coordinator._do_fetch(auth_retry_used=False)
         assert exc_info.value.layer == LAYER_PCCS  # PCCS won the race
+
+    def test_broken_status_accessor_degrades_without_leaking(
+        self, coordinator: PolestarCoordinator, caplog: pytest.LogCaptureFixture
+    ):
+        class BrokenCode(grpc.RpcError):
+            def code(self):
+                raise RuntimeError("backend-sensitive-detail")
+
+        coordinator.cep.get_parked_location = MagicMock(side_effect=BrokenCode())
+
+        with caplog.at_level(
+            logging.WARNING, logger="custom_components.polestar_soc.coordinator"
+        ):
+            result = coordinator._do_fetch(auth_retry_used=False)
+
+        assert result["api_health"]["cep"]["last_code"] == "RPC_ERROR"
+        assert "parked_location" in result["api_health"]["cep"]["failing_endpoints"]
+        messages = " ".join(record.getMessage() for record in caplog.records)
+        assert "backend-sensitive-detail" not in messages
 
 
 class TestDoFetchLastKnownGood:

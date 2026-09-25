@@ -41,6 +41,9 @@
       "software_version": {
         "name": "Software version"
       },
+      "charge_location": {
+        "name": "Charge location"
+      },
       "battery_soc": {
         "name": "Battery SOC"
       },
@@ -119,6 +122,26 @@
         }
       }
     },
+    "button": {
+      "warm_car": {
+        "name": "Warm car"
+      },
+      "start_charging": {
+        "name": "Start charging"
+      },
+      "stop_charging": {
+        "name": "Stop charging"
+      },
+      "flash_lights": {
+        "name": "Flash lights"
+      },
+      "honk_and_flash": {
+        "name": "Honk and flash"
+      },
+      "unlock_trunk": {
+        "name": "Unlock trunk"
+      }
+    },
     "number": {
       "charge_limit": {
         "name": "Charge limit"
@@ -189,6 +212,9 @@
     "device_tracker": {
       "location": {
         "name": "Location"
+      },
+      "parked_location": {
+        "name": "Parked location"
       }
     },
     "binary_sensor": {

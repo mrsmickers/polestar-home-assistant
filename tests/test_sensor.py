@@ -3,6 +3,8 @@
 from custom_components.polestar_soc.sensor import (
     _battery_soc,
     _cep_is_explicitly_not_charging,
+    _charge_location_attributes,
+    _charge_location_name,
     _charging_power,
     _charging_status,
     _charging_time_remaining,
@@ -518,3 +520,44 @@ class TestEstimatedRangeMiles:
     def test_none_when_missing_key(self):
         data = {"cep_battery": {VIN: {"soc": 76.0}}}
         assert _estimated_range_miles(data, VIN) is None
+
+
+class TestChargeLocation:
+    @staticmethod
+    def _data(current_id: str = "home-id") -> dict:
+        return {
+            "current_charge_location": {
+                VIN: {"status": 1, "location_id": current_id, "arrived_at": 1234}
+            },
+            "charge_locations": {
+                VIN: [
+                    {
+                        "location_id": "home-id",
+                        "alias": "Home",
+                        "amp_limit": 16,
+                        "minimum_soc": 20,
+                        "optimised_charging": True,
+                        "bidirectional_charging": False,
+                        "available_optimised_charging": 2,
+                        "location_type": 1,
+                    }
+                ]
+            },
+        }
+
+    def test_current_location_resolves_alias(self):
+        assert _charge_location_name(self._data(), VIN) == "Home"
+
+    def test_unknown_location_uses_identifier(self):
+        assert _charge_location_name(self._data("other-id"), VIN) == "other-id"
+
+    def test_no_current_location_returns_none(self):
+        assert _charge_location_name(self._data(""), VIN) is None
+
+    def test_attributes_expose_settings_without_coordinates(self):
+        attrs = _charge_location_attributes(self._data(), VIN)
+        assert attrs["saved_location_count"] == 1
+        assert attrs["current_location_id"] == "home-id"
+        assert attrs["saved_locations"] == self._data()["charge_locations"][VIN]
+        assert "latitude" not in str(attrs)
+        assert "longitude" not in str(attrs)

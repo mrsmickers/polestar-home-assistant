@@ -9,7 +9,9 @@ Uses the web OAuth access token for reads and the PCCS 2FA token for writes.
 
 from __future__ import annotations
 
+import datetime
 import logging
+import math
 import re
 import uuid
 
@@ -40,6 +42,8 @@ from .proto import (
 
 _LOGGER = logging.getLogger(__name__)
 
+_MAX_TRACKER_TIMESTAMP_MS = 253_402_300_799_999
+
 # gRPC service method paths
 _METHOD_GET_CLIMATE = (
     "/services.vehiclestates.parkingclimatization"
@@ -52,17 +56,36 @@ _METHOD_GET_AVAILABILITY = (
 )
 _METHOD_GET_HEALTH = "/services.vehiclestates.health.HealthService/GetHealth"
 _METHOD_GET_LOCATION = "/dtlinternet.DtlInternetService/GetLastKnownLocation"
+_METHOD_GET_PARKED_LOCATION = "/dtlinternet.DtlInternetService/GetLastParkedLocation"
 _METHOD_GET_MYCARS = "/car_information.CarInformation/GetMyCars"
+_SVC_CHARGE_NOW = "/chronos.services.v1.ChargeNowService"
+_METHOD_CHARGE_NOW_START = f"{_SVC_CHARGE_NOW}/StartOverrideChargeTimer"
+_METHOD_CHARGE_NOW_STOP = f"{_SVC_CHARGE_NOW}/StopOverrideChargeTimer"
+_SVC_CHARGE_LOCATION = "/chronos.services.v1.ChargeLocationService"
+_METHOD_GET_CHARGE_LOCATIONS = f"{_SVC_CHARGE_LOCATION}/GetChargeLocations"
+_METHOD_GET_CURRENT_CHARGE_LOCATION = f"{_SVC_CHARGE_LOCATION}/isAtALocation"
 _SVC_INVOCATION = "/invocation.InvocationService"
 _METHOD_WINDOW_CONTROL = f"{_SVC_INVOCATION}/WindowControl"
+_METHOD_HONK_FLASH = f"{_SVC_INVOCATION}/HonkFlash"
+_METHOD_CEP_UNLOCK = f"{_SVC_INVOCATION}/Unlock"
 
 # BatteryState field numbers captured in raw_fields for debugging.
 _RAW_BATTERY_FIELD_NUMBERS = (5, 7, 8, 10, 17, 26, 28)
 _SOFTWARE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+() /-]{0,63}$")
+_CHARGE_COMMAND_ACCEPTED = frozenset({1})
 
 
 class CepDataError(HomeAssistantError):
     """A CEP response could not be attributed or validated safely."""
+
+
+def _grpc_status_name(err: grpc.RpcError) -> str:
+    """Return an allowlisted gRPC status name without backend details."""
+    try:
+        code = err.code()
+    except Exception:
+        return "RPC_ERROR"
+    return code.name if isinstance(code, grpc.StatusCode) else "RPC_ERROR"
 
 
 def _require_valid_vin(vin: str, *, source: str) -> None:
@@ -71,18 +94,38 @@ def _require_valid_vin(vin: str, *, source: str) -> None:
         raise CepDataError(f"GetMyCars received an invalid {source} VIN")
 
 
-def _get_strict_utf8(fields: dict[int, list], field_number: int, label: str) -> str:
+def _get_strict_utf8(
+    fields: dict[int, list],
+    field_number: int,
+    label: str,
+    *,
+    source: str = "GetMyCars",
+) -> str:
     """Decode the last value of a singular string field as strict UTF-8."""
     values = fields.get(field_number)
     if not values:
         return ""
     raw = values[-1]
     if not isinstance(raw, (bytes, bytearray)):
-        raise CepDataError(f"GetMyCars {label} field has the wrong wire type")
+        raise CepDataError(f"{source} {label} field has the wrong wire type")
     try:
         return bytes(raw).decode("utf-8", errors="strict")
     except UnicodeDecodeError as err:
-        raise CepDataError(f"GetMyCars {label} field contains invalid UTF-8") from err
+        raise CepDataError(f"{source} {label} field contains invalid UTF-8") from err
+
+
+def _validate_response_vin(
+    fields: dict[int, list],
+    field_number: int,
+    requested_vin: str,
+    *,
+    source: str,
+) -> None:
+    """Require a valid response VIN matching the requested vehicle."""
+    _require_valid_vin(requested_vin, source="requested")
+    response_vin = _get_strict_utf8(fields, field_number, "VIN", source=source)
+    if VIN_PATTERN.fullmatch(response_vin) is None or response_vin != requested_vin:
+        raise CepDataError(f"{source} returned a missing or mismatched VIN")
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +149,20 @@ def _build_get_mycars_request(vin: str) -> bytes:
     return _encode_field_bytes(1, str(uuid.uuid4()).encode("utf-8")) + _encode_field_bytes(
         2, vin.encode("utf-8")
     )
+
+
+def _build_charge_now_request(vin: str) -> bytes:
+    """Build a C3 Chronos request for charge-override commands."""
+    _require_valid_vin(vin, source="requested")
+    request = b""
+    request += _encode_field_bytes(1, str(uuid.uuid4()).encode("utf-8"))
+    request += _encode_field_bytes(2, vin.encode("utf-8"))
+    request += _encode_field_bytes(3, b"RCS")
+    utc_offset = datetime.datetime.now(datetime.UTC).astimezone().utcoffset()
+    offset_minutes = int((utc_offset or datetime.timedelta()).total_seconds()) // 60
+    encoded_offset = offset_minutes if offset_minutes >= 0 else offset_minutes + (1 << 64)
+    request += _encode_field_bytes(4, _encode_field_varint(1, encoded_offset))
+    return _encode_field_bytes(1, request)
 
 
 def _build_cep_invocation_request(vin: str) -> bytes:
@@ -133,6 +190,24 @@ def _build_window_control_request(vin: str, control_type: int) -> bytes:
     msg = _encode_field_bytes(1, _build_cep_invocation_request(vin))
     msg += _encode_field_varint(2, control_type)
     return msg
+
+
+def _build_honk_flash_request(vin: str, action: int) -> bytes:
+    """Build HonkAndFlashRequest for action 0=both, 1=honk, 2=flash."""
+    _require_valid_vin(vin, source="requested")
+    if action not in {0, 1, 2}:
+        raise ValueError("Invalid honk/flash action")
+    return _encode_field_bytes(
+        1, _build_cep_invocation_request(vin)
+    ) + _encode_field_varint(2, action)
+
+
+def _build_trunk_unlock_request(vin: str) -> bytes:
+    """Build CarUnlockRequest with trunk-only unlock type."""
+    _require_valid_vin(vin, source="requested")
+    return _encode_field_bytes(
+        1, _build_cep_invocation_request(vin)
+    ) + _encode_field_varint(2, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +266,62 @@ def _parse_mycars_response(data: bytes, vin: str) -> dict:
     ):
         raise CepDataError("GetMyCars returned an invalid installed software version")
     return matching
+
+
+def _parse_charge_now_response(data: bytes) -> int:
+    """Parse the direct ResponseStatus field from a charge-now response."""
+    status = _get_optional_int(_decode_message(data), 1) if data else None
+    if status is None:
+        raise CepDataError("Charge-now response is missing status")
+    return status
+
+
+def _parse_charge_locations_response(data: bytes, vin: str) -> list[dict]:
+    """Parse saved charge locations without exposing precise coordinates."""
+    response = _decode_message(data)
+    _validate_response_vin(response, 2, vin, source="Charge locations")
+    locations: list[dict] = []
+    for raw_location in response.get(3, []):
+        if not isinstance(raw_location, (bytes, bytearray)):
+            raise CepDataError("Charge locations entry has the wrong wire type")
+        fields = _decode_message(bytes(raw_location))
+        location_id = _get_strict_utf8(
+            fields, 2, "location ID", source="Charge locations"
+        )
+        if not location_id:
+            raise CepDataError("Charge locations entry omitted location ID")
+        locations.append(
+            {
+                "location_id": location_id,
+                "alias": _get_strict_utf8(
+                    fields, 3, "alias", source="Charge locations"
+                ),
+                "amp_limit": _get_optional_int(fields, 5),
+                "minimum_soc": _get_optional_int(fields, 6),
+                "optimised_charging": bool(_get_optional_int(fields, 7)),
+                "bidirectional_charging": bool(_get_optional_int(fields, 8)),
+                "available_optimised_charging": _get_optional_int(fields, 9),
+                "location_type": _get_optional_int(fields, 12),
+            }
+        )
+    return locations
+
+
+def _parse_current_charge_location_response(data: bytes) -> dict:
+    """Parse whether the vehicle is at a saved charge location."""
+    fields = _decode_message(data)
+    status = _get_optional_int(fields, 1)
+    if status is None:
+        raise CepDataError("Current charge location response is missing status")
+    if status != 1:
+        raise CepDataError(f"Current charge location failed with status {status}")
+    return {
+        "status": status,
+        "location_id": _get_strict_utf8(
+            fields, 2, "location ID", source="Current charge location"
+        ),
+        "arrived_at": _get_optional_int(fields, 3),
+    }
 
 
 def _format_climate_status(value: int) -> str:
@@ -490,8 +621,8 @@ def _parse_health_response(data: bytes) -> dict:
     return result
 
 
-def _parse_location_response(data: bytes) -> dict:
-    """Parse GetLastKnownLocation response.
+def _parse_location_response(data: bytes, vin: str) -> dict:
+    """Parse a VIN-bound location response.
 
     Unlike climate/battery, location fields are at the top level (no envelope).
     Field mapping:
@@ -501,10 +632,8 @@ def _parse_location_response(data: bytes) -> dict:
         field 4 (varint): timestamp_ms (milliseconds since epoch)
     """
     empty: dict = {"latitude": None, "longitude": None, "timestamp_ms": None}
-    if not data:
-        return empty
-
     fields = _decode_message(data)
+    _validate_response_vin(fields, 1, vin, source="Location")
     latitude = _get_double(fields, 3)
     longitude = _get_double(fields, 2)
     if latitude is None or longitude is None:
@@ -513,7 +642,43 @@ def _parse_location_response(data: bytes) -> dict:
     return {
         "latitude": latitude,
         "longitude": longitude,
-        "timestamp_ms": _get_int(fields, 4) or None,
+        "timestamp_ms": _get_optional_int(fields, 4),
+    }
+
+
+def _parse_parked_location_response(data: bytes, vin: str) -> dict:
+    """Parse the APK-native nested LastParkedLocation response."""
+    fields = _decode_message(data)
+    _validate_response_vin(fields, 1, vin, source="Parked location")
+    location = _get_submessage(fields, 2)
+    if location is None:
+        raise CepDataError("Parked location response is missing location")
+
+    longitude = _get_double(location, 1)
+    latitude = _get_double(location, 2)
+    timestamp = _get_submessage(location, 3)
+    if longitude is None or latitude is None or timestamp is None:
+        raise CepDataError("Parked location response is incomplete")
+    if (
+        not math.isfinite(longitude)
+        or not math.isfinite(latitude)
+        or not -180 <= longitude <= 180
+        or not -90 <= latitude <= 90
+    ):
+        raise CepDataError("Parked location coordinates are invalid")
+
+    seconds = _get_optional_int(timestamp, 1)
+    nanos = _get_optional_int(timestamp, 2) or 0
+    if seconds is None or not 0 <= nanos < 1_000_000_000:
+        raise CepDataError("Parked location timestamp is invalid")
+    timestamp_ms = seconds * 1000 + nanos // 1_000_000
+    if not 0 <= timestamp_ms <= _MAX_TRACKER_TIMESTAMP_MS:
+        raise CepDataError("Parked location timestamp is not representable")
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp_ms": timestamp_ms,
     }
 
 
@@ -597,7 +762,7 @@ class CepClient:
             response = method(_build_vin_request(vin), metadata=self._metadata(vin), timeout=30)
             return _parse_climate_response(response)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetLatestParkingClimatization failed: %s", err)
+            _LOGGER.debug("CEP parking climatization failed: %s", _grpc_status_name(err))
             raise
 
     def get_mycars(self, vin: str) -> dict:
@@ -616,8 +781,69 @@ class CepClient:
             )
             return _parse_mycars_response(response, vin)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetMyCars failed: %s", err)
+            _LOGGER.debug("CEP GetMyCars failed: %s", _grpc_status_name(err))
             raise
+
+    def _get_charge_location_data(self, vin: str, method_path: str) -> bytes:
+        """Fetch one read-only charge-location response."""
+        channel = self._get_channel()
+        method = channel.unary_unary(
+            method_path,
+            request_serializer=_identity_serialize,
+            response_deserializer=_identity_deserialize,
+        )
+        try:
+            return method(
+                _build_charge_now_request(vin),
+                metadata=tuple(self._metadata(vin)),
+                timeout=30,
+            )
+        except grpc.RpcError as err:
+            _LOGGER.debug("CEP charge-location call failed: %s", _grpc_status_name(err))
+            raise
+
+    def get_charge_locations(self, vin: str) -> list[dict]:
+        """Get saved charge locations and their charging settings."""
+        return _parse_charge_locations_response(
+            self._get_charge_location_data(vin, _METHOD_GET_CHARGE_LOCATIONS), vin
+        )
+
+    def get_current_charge_location(self, vin: str) -> dict:
+        """Get the saved charge location currently containing the vehicle."""
+        return _parse_current_charge_location_response(
+            self._get_charge_location_data(vin, _METHOD_GET_CURRENT_CHARGE_LOCATION)
+        )
+
+    def _set_charge_override(self, vin: str, method_path: str) -> dict:
+        """Start or stop the current charging-schedule override."""
+        channel = self._get_channel()
+        method = channel.unary_unary(
+            method_path,
+            request_serializer=_identity_serialize,
+            response_deserializer=_identity_deserialize,
+        )
+        try:
+            response = method(
+                _build_charge_now_request(vin),
+                metadata=tuple(self._write_metadata(vin)),
+                timeout=30,
+            )
+        except grpc.RpcError as err:
+            _LOGGER.debug("CEP charge override call failed: %s", _grpc_status_name(err))
+            raise
+
+        status = _parse_charge_now_response(response)
+        if status not in _CHARGE_COMMAND_ACCEPTED:
+            raise CepError(f"Charge command failed with status {status}")
+        return {"status": status}
+
+    def start_charging(self, vin: str) -> dict:
+        """Start charging by overriding the configured charging timer."""
+        return self._set_charge_override(vin, _METHOD_CHARGE_NOW_START)
+
+    def stop_charging(self, vin: str) -> dict:
+        """Stop the current charging-timer override."""
+        return self._set_charge_override(vin, _METHOD_CHARGE_NOW_STOP)
 
     def get_battery(self, vin: str) -> dict:
         """Get current battery state."""
@@ -631,7 +857,7 @@ class CepClient:
             response = method(_build_vin_request(vin), metadata=self._metadata(vin), timeout=30)
             return _parse_battery_response(response)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetLatestBattery failed: %s", err)
+            _LOGGER.debug("CEP battery call failed: %s", _grpc_status_name(err))
             raise
 
     def get_exterior(self, vin: str) -> dict:
@@ -646,7 +872,7 @@ class CepClient:
             response = method(_build_vin_request(vin), metadata=self._metadata(vin), timeout=30)
             return _parse_exterior_response(response)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetLatestExterior failed: %s", err)
+            _LOGGER.debug("CEP exterior call failed: %s", _grpc_status_name(err))
             raise
 
     def get_availability(self, vin: str) -> dict:
@@ -661,7 +887,7 @@ class CepClient:
             response = method(_build_vin_request(vin), metadata=self._metadata(vin), timeout=30)
             return _parse_availability_response(response)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetLatestAvailability failed: %s", err)
+            _LOGGER.debug("CEP availability call failed: %s", _grpc_status_name(err))
             raise
 
     def get_health(self, vin: str) -> dict:
@@ -681,7 +907,7 @@ class CepClient:
             for response in responses:
                 return _parse_health_response(response)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetHealth failed: %s", err)
+            _LOGGER.debug("CEP health call failed: %s", _grpc_status_name(err))
             raise
         # Stream yielded no responses
         return _parse_health_response(b"")
@@ -698,9 +924,26 @@ class CepClient:
             response = method(
                 _build_location_request(vin), metadata=self._metadata(vin), timeout=30
             )
-            return _parse_location_response(response)
+            return _parse_location_response(response, vin)
         except grpc.RpcError as err:
-            _LOGGER.debug("CEP GetLastKnownLocation failed: %s", err)
+            _LOGGER.debug("CEP last-known location failed: %s", _grpc_status_name(err))
+            raise
+
+    def get_parked_location(self, vin: str) -> dict:
+        """Get the vehicle's last parked location."""
+        channel = self._get_channel()
+        method = channel.unary_unary(
+            _METHOD_GET_PARKED_LOCATION,
+            request_serializer=_identity_serialize,
+            response_deserializer=_identity_deserialize,
+        )
+        try:
+            response = method(
+                _build_location_request(vin), metadata=self._metadata(vin), timeout=30
+            )
+            return _parse_parked_location_response(response, vin)
+        except grpc.RpcError as err:
+            _LOGGER.debug("CEP parked location failed: %s", _grpc_status_name(err))
             raise
 
     # -- Window Control (InvocationService) ---------------------------------
@@ -712,6 +955,8 @@ class CepClient:
         request: bytes,
         *,
         command_name: str = "Command",
+        allow_delivered_on_cancel: bool = False,
+        require_response_vin: bool = False,
     ) -> dict:
         """Send a CEP InvocationService command and wait for terminal status.
 
@@ -719,8 +964,8 @@ class CepClient:
         intermediate statuses (SENT, DELIVERED) before a terminal status
         (SUCCESS or an error). We iterate until we reach a terminal status.
 
-        The server may cancel the stream before SUCCESS arrives. If we
-        received DELIVERED before cancellation, we treat it as success.
+        Security-sensitive controls require terminal SUCCESS. Legacy window
+        controls may explicitly retain their historical DELIVERED behaviour.
         """
         channel = self._get_channel()
         method = channel.unary_stream(
@@ -736,18 +981,23 @@ class CepClient:
                 status = result.get("status", 0)
                 if status not in _INVOCATION_INTERMEDIATE_STATUSES:
                     break
-        except grpc.RpcError as err:
+        except grpc.RpcError:
             if result.get("status") == 4:  # DELIVERED
-                _LOGGER.debug(
-                    "CEP %s stream cancelled after DELIVERED — treating as success",
-                    method_path,
-                )
-                return result
-            _LOGGER.debug("CEP %s failed: %s", method_path, err)
+                if allow_delivered_on_cancel:
+                    _LOGGER.debug("CEP command stream ended after delivery")
+                    return result
+                raise CepError(
+                    f"{command_name} delivered but execution result unavailable"
+                ) from None
+            _LOGGER.debug("CEP command stream failed before terminal success")
             raise
 
         status = result.get("status", 0)
-        if status not in (4, 6):  # Not DELIVERED or SUCCESS
+        if status == 4 and not allow_delivered_on_cancel:
+            raise CepError(
+                f"{command_name} delivered but execution result unavailable"
+            )
+        if status != 6 and not (status == 4 and allow_delivered_on_cancel):
             status_name = INVOCATION_STATUS_MAP.get(status, f"STATUS_{status}")
             server_msg = result.get("message", "")
             msg = f"{command_name} failed: {status_name}"
@@ -755,7 +1005,35 @@ class CepClient:
                 msg += f" - {server_msg}"
             raise CepError(msg)
 
+        if status == 6 and require_response_vin:
+            response_vin = result.get("vin", "")
+            _require_valid_vin(response_vin, source=f"{command_name} response")
+            if response_vin != vin:
+                raise CepDataError(f"{command_name} response VIN does not match request")
+
         return result
+
+    def honk_flash(self, vin: str, action: int) -> dict:
+        """Honk, flash, or honk and flash the vehicle."""
+        request = _build_honk_flash_request(vin, action)
+        return self._send_invocation(
+            vin,
+            _METHOD_HONK_FLASH,
+            request,
+            command_name="Honk/flash",
+            require_response_vin=True,
+        )
+
+    def unlock_trunk(self, vin: str) -> dict:
+        """Unlock the vehicle trunk only."""
+        request = _build_trunk_unlock_request(vin)
+        return self._send_invocation(
+            vin,
+            _METHOD_CEP_UNLOCK,
+            request,
+            command_name="Trunk unlock",
+            require_response_vin=True,
+        )
 
     def window_open(self, vin: str) -> dict:
         """Open all vehicle windows.
@@ -765,7 +1043,11 @@ class CepClient:
         """
         request = _build_window_control_request(vin, 1)  # OPEN_ALL
         return self._send_invocation(
-            vin, _METHOD_WINDOW_CONTROL, request, command_name="Window control"
+            vin,
+            _METHOD_WINDOW_CONTROL,
+            request,
+            command_name="Window control",
+            allow_delivered_on_cancel=True,
         )
 
     def window_close(self, vin: str) -> dict:
@@ -776,5 +1058,9 @@ class CepClient:
         """
         request = _build_window_control_request(vin, 2)  # CLOSE_ALL
         return self._send_invocation(
-            vin, _METHOD_WINDOW_CONTROL, request, command_name="Window control"
+            vin,
+            _METHOD_WINDOW_CONTROL,
+            request,
+            command_name="Window control",
+            allow_delivered_on_cancel=True,
         )

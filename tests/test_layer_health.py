@@ -53,11 +53,21 @@ class TestClassifyError:
 
         assert _classify_error(CodeRaises()) == "RPC_ERROR"
 
+    def test_backend_controlled_code_name_is_rejected(self):
+        class ForgedCode:
+            name = "backend-sensitive-detail"
+
+        class ForgedCodeError(grpc.RpcError):
+            def code(self):  # type: ignore[override]
+                return ForgedCode()
+
+        assert _classify_error(ForgedCodeError()) == "RPC_ERROR"
+
     def test_non_grpc_error(self):
-        assert _classify_error(ValueError("x")) == "ValueError"
+        assert _classify_error(ValueError("x")) == "NON_GRPC_ERROR"
 
     def test_non_grpc_marker(self):
-        assert _classify_error(_NonGrpcError("x")) == "_NonGrpcError"
+        assert _classify_error(_NonGrpcError("x")) == "NON_GRPC_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +193,37 @@ class TestLayerHealthWarnOnce:
         assert len(warnings) == 1
         assert "PERMISSION_DENIED" in warnings[0].getMessage()
         assert "target_soc" in warnings[0].getMessage()
+
+    def test_warning_omits_backend_exception_details(self, caplog: pytest.LogCaptureFixture):
+        h = _LayerHealth()
+        with caplog.at_level(logging.WARNING, logger="custom_components.polestar_soc.coordinator"):
+            h.start_cycle()
+            h.record_failure(
+                LAYER_CEP,
+                "parked_location",
+                _rpc_error(grpc.StatusCode.UNAVAILABLE, "backend-sensitive-detail"),
+            )
+            h.end_cycle()
+        message = " ".join(record.getMessage() for record in caplog.records)
+        assert "UNAVAILABLE" in message
+        assert "parked_location" in message
+        assert "backend-sensitive-detail" not in message
+
+    def test_non_grpc_warning_omits_exception_detail(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        h = _LayerHealth()
+        with caplog.at_level(
+            logging.WARNING, logger="custom_components.polestar_soc.coordinator"
+        ):
+            h.start_cycle()
+            h.record_failure(
+                LAYER_CEP, "parked_location", ValueError("backend-sensitive-detail")
+            )
+            h.end_cycle()
+        message = " ".join(record.getMessage() for record in caplog.records)
+        assert "NON_GRPC_ERROR" in message
+        assert "backend-sensitive-detail" not in message
 
     def test_repeat_failure_does_not_re_warn(self, caplog: pytest.LogCaptureFixture):
         h = _LayerHealth()
