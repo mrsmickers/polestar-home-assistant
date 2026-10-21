@@ -62,6 +62,10 @@ _AUTH_GRPC_CODE_NAMES: frozenset[str] = frozenset(
 _FAILED: object = object()
 
 
+class InvalidOTPError(UpdateFailed):
+    """Provider returned the same usable OTP challenge after rejecting a code."""
+
+
 class _GrpcAuthError(Exception):
     """Internal signal: a gRPC call returned PERMISSION_DENIED / UNAUTHENTICATED.
 
@@ -341,9 +345,9 @@ class PolestarAPI:
             timeout=HTTP_TIMEOUT,
         )
         _LOGGER.debug(
-            "OTP submit response: status=%s, location=%s, has_success_form=%s",
+            "OTP submit response: status=%s, has_location=%s, has_success_form=%s",
             resp.status_code,
-            resp.headers.get("Location", ""),
+            bool(resp.headers.get("Location")),
             "otp-success-form" in resp.text,
         )
         # OTP success returns a page with auto-submit form
@@ -368,9 +372,9 @@ class PolestarAPI:
                 timeout=HTTP_TIMEOUT,
             )
             _LOGGER.debug(
-                "OTP continue response: status=%s, location=%s",
+                "OTP continue response: status=%s, has_location=%s",
                 resp.status_code,
-                resp.headers.get("Location", ""),
+                bool(resp.headers.get("Location")),
             )
         return resp
 
@@ -388,10 +392,10 @@ class PolestarAPI:
         # Check for error in redirect (e.g. failed OTP returns
         # polestar-explore://...?error=access_denied)
         if "error" in params:
-            error = params["error"][0]
-            error_desc = params.get("error_description", [""])[0]
-            _LOGGER.debug("Auth redirect contains error: %s (%s)", error, error_desc)
-            raise UpdateFailed(f"Authentication failed: {error_desc or error}")
+            _LOGGER.debug(
+                "Auth redirect contains error: has_description=%s", "error_description" in params
+            )
+            raise UpdateFailed("Authentication failed")
 
         # Handle consent/confirmation
         if "code" not in params and "uid" in params:
@@ -418,7 +422,7 @@ class PolestarAPI:
                 params = parse_qs(parsed.query)
 
         if "code" not in params:
-            _LOGGER.debug("No auth code in redirect URL: %s", redirect_url)
+            _LOGGER.debug("No auth code in redirect")
             raise UpdateFailed("No authorization code received")
 
         return params["code"][0]
@@ -482,8 +486,7 @@ class PolestarAPI:
         csrf_match = re.search(r'cSRFToken:\s*"([^"]+)"', resp.text)
         csrf_token = csrf_match.group(1) if csrf_match else ""
         _LOGGER.debug(
-            "OTP challenge detected: url=%s, has_csrf=%s",
-            otp_url,
+            "OTP challenge detected: has_csrf=%s",
             bool(csrf_token),
         )
         return otp_url, csrf_token
@@ -513,7 +516,7 @@ class PolestarAPI:
                 if not otp_code:
                     raise UpdateFailed("2FA code required but not provided")
 
-                _LOGGER.debug("Submitting OTP to %s", otp_resume)
+                _LOGGER.debug("Submitting OTP")
                 resp = self._submit_otp(session, otp_resume, otp_code, csrf_token)
 
                 if resp.status_code not in (302, 303):
@@ -579,10 +582,19 @@ class PolestarAPI:
         resume_url: str = session_state["resume_url"]
         code_verifier: str = session_state["code_verifier"]
 
-        _LOGGER.debug("Submitting OTP to %s", otp_resume)
+        _LOGGER.debug("Submitting OTP")
         resp = self._submit_otp(session, otp_resume, otp_code, csrf_token)
 
         if resp.status_code not in (302, 303):
+            challenge = self._detect_otp_challenge(resp, resume_url)
+            if (
+                challenge
+                and challenge[0] == otp_resume
+                and challenge[1].strip()
+                and "Invalid OTP code" in resp.text
+            ):
+                session_state["csrf_token"] = challenge[1]
+                raise InvalidOTPError("Invalid verification code")
             raise UpdateFailed(f"2FA verification failed ({resp.status_code})")
 
         auth_code = self._extract_auth_code(session, resp, resume_url)

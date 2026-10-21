@@ -17,9 +17,17 @@
           "password": "Password"
         }
       },
+      "reconfigure_confirm": {
+        "title": "Renew Polestar control authentication",
+        "description": "Re-enter the credentials for this existing Polestar account. This will renew both web access and control authentication.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
       "otp": {
         "title": "Verification code",
-        "description": "A verification code has been sent to your Polestar ID email. Enter it below to enable charge limit and charge timer controls. You can leave this blank to skip \u2014 other sensors will still work.",
+        "description": "Enter the verification code sent to your Polestar ID email to enable controls. For first-time setup you may leave it blank to skip; renewing an existing account requires the code.",
         "data": {
           "otp": "Verification code"
         }
@@ -29,11 +37,15 @@
       "invalid_auth": "Invalid email or password.",
       "cannot_connect": "Could not connect to Polestar API.",
       "no_vehicles": "No vehicles found on this account.",
-      "invalid_otp": "Invalid verification code. Please try again."
+      "invalid_otp": "Invalid verification code. Please try again.",
+      "otp_required": "Enter the verification code to renew control authentication."
     },
     "abort": {
       "already_configured": "This account is already configured.",
-      "reauth_successful": "Re-authentication successful."
+      "reauth_successful": "Re-authentication successful.",
+      "reconfigure_successful": "Control authentication renewed.",
+      "entry_missing": "This configuration entry no longer exists. Start again from the existing integration.",
+      "unique_id_mismatch": "This is a different Polestar account. Use the account already configured."
     }
   },
   "entity": {
