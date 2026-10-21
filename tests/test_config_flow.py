@@ -9,6 +9,7 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from custom_components.polestar_soc.config_flow import PolestarSOCConfigFlow
+from custom_components.polestar_soc.coordinator import InvalidOTPError
 
 _WEB_TOKENS = {
     "access_token": "web_access_tok",
@@ -122,7 +123,7 @@ class TestConfigFlowUser:
 
         pccs_api_bad = MagicMock()
         pccs_api_bad.login_complete_2fa = MagicMock(
-            side_effect=Exception("2FA verification failed")
+            side_effect=InvalidOTPError("Invalid verification code")
         )
 
         pccs_api_good = MagicMock()

@@ -1,12 +1,14 @@
 """Tests for PolestarAPI two-phase login (login_start_2fa / login_complete_2fa)."""
 
+import logging
+import traceback
 from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from custom_components.polestar_soc.coordinator import PolestarAPI
+from custom_components.polestar_soc.coordinator import InvalidOTPError, PolestarAPI
 
 # Fake HTML pages returned by the OIDC server during login flow.
 _AUTH_PAGE_HTML = '<form action="/as/abc123/resume/as/authorization.ping">login</form>'
@@ -195,7 +197,7 @@ class TestLoginComplete2fa:
         assert api.access_token == "pccs_access_tok"
 
     def test_raises_on_invalid_otp(self):
-        """Invalid OTP returns non-redirect status, raises UpdateFailed."""
+        """Only a re-presented identical OTP challenge confirms retry safety."""
         api = PolestarAPI(client_id="test_client", redirect_uri="https://test/callback")
 
         session_mock = MagicMock()
@@ -203,17 +205,105 @@ class TestLoginComplete2fa:
         def post_side_effect(url, **kwargs):
             resp = MagicMock()
             resp.status_code = 200
-            resp.text = "Invalid OTP code"
+            resp.text = (
+                '<form action="/as/otp789/resume/as/authorization.ping">Invalid OTP code</form>'
+                '<script>cSRFToken: "rotated-csrf"</script>'
+            )
             return resp
 
         session_mock.post = post_side_effect
 
         session_state = {
             "session": session_mock,
-            "otp_resume": "https://example.com/otp",
+            "otp_resume": "https://polestarid.eu.polestar.com/as/otp789/resume/as/authorization.ping",
+            "csrf_token": "old-csrf",
             "resume_url": "https://example.com/resume",
             "code_verifier": "test_verifier",
         }
 
-        with pytest.raises(UpdateFailed, match="2FA verification failed"):
+        with pytest.raises(InvalidOTPError):
             api.login_complete_2fa(session_state, "wrong_code")
+        assert session_state["csrf_token"] == "rotated-csrf"
+
+    @pytest.mark.parametrize("csrf_markup", ["", '<script>cSRFToken: "   "</script>'])
+    def test_same_invalid_code_challenge_without_nonblank_csrf_is_not_retryable(self, csrf_markup):
+        api = PolestarAPI(client_id="test_client", redirect_uri="https://test/callback")
+        session = MagicMock()
+        session.post.return_value = MagicMock(
+            status_code=200,
+            text=(
+                '<form action="/as/otp789/resume/as/authorization.ping">'
+                f"Invalid OTP code</form>{csrf_markup}"
+            ),
+        )
+        state = {
+            "session": session,
+            "otp_resume": "https://polestarid.eu.polestar.com/as/otp789/resume/as/authorization.ping",
+            "csrf_token": "old-csrf",
+            "resume_url": "https://example.com/resume",
+            "code_verifier": "verifier",
+        }
+        with pytest.raises(UpdateFailed, match="2FA verification failed") as err:
+            api.login_complete_2fa(state, "wrong")
+        assert not isinstance(err.value, InvalidOTPError)
+        assert state["csrf_token"] == "old-csrf"
+
+    def test_unrecognised_otp_response_is_not_retryable(self):
+        api = PolestarAPI(client_id="test_client", redirect_uri="https://test/callback")
+        session = MagicMock()
+        response = MagicMock(status_code=200, text="Invalid OTP code")
+        session.post.return_value = response
+        state = {
+            "session": session,
+            "otp_resume": "https://example.com/otp",
+            "resume_url": "https://example.com/resume",
+            "code_verifier": "verifier",
+        }
+        with pytest.raises(UpdateFailed, match="2FA verification failed"):
+            api.login_complete_2fa(state, "wrong")
+
+    def test_same_challenge_without_explicit_rejection_is_not_retryable(self):
+        api = PolestarAPI(client_id="test_client", redirect_uri="https://test/callback")
+        session = MagicMock()
+        session.post.return_value = MagicMock(
+            status_code=200,
+            text='<form action="/as/otp789/resume/as/authorization.ping">OTP</form>',
+        )
+        state = {
+            "session": session,
+            "otp_resume": "https://polestarid.eu.polestar.com/as/otp789/resume/as/authorization.ping",
+            "resume_url": "https://example.com/resume",
+            "code_verifier": "verifier",
+        }
+        with pytest.raises(UpdateFailed) as err:
+            api.login_complete_2fa(state, "wrong")
+        assert not isinstance(err.value, InvalidOTPError)
+
+
+def test_otp_failure_does_not_log_session_url_or_provider_redirect_error(caplog):
+    """Both submission and redirect errors must be safe at DEBUG."""
+    api = PolestarAPI(client_id="test_client", redirect_uri="https://test/callback")
+    response = MagicMock(
+        status_code=302,
+        text="",
+        headers={
+            "Location": "polestar-explore://callback?error=bad&error_description=secret-marker"
+        },
+    )
+    session = MagicMock()
+    session.post.return_value = response
+    state = {
+        "session": session,
+        "otp_resume": "https://example.com/as/session-secret/resume/as/authorization.ping",
+        "resume_url": "https://example.com/as/session-secret/resume/as/authorization.ping",
+        "code_verifier": "verifier",
+        "csrf_token": "csrf-secret",
+    }
+    code = "otp-secret"
+    with caplog.at_level(logging.DEBUG), pytest.raises(UpdateFailed) as err:
+        api.login_complete_2fa(state, code)
+    rendered = "".join(traceback.format_exception(err.value))
+    for secret in ("session-secret", "secret-marker", "csrf-secret", "otp-secret"):
+        assert secret not in caplog.text
+        assert secret not in str(err.value)
+        assert secret not in rendered
